@@ -71,6 +71,7 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         use std::fs;
         use egui::{PointerButton, Key, ViewportCommand, Vec2, Rect, Sense, Pos2, Color32, ColorImage};
+        use rfd::FileDialog;
 
         let input = ctx.input(|i| i.clone());
         let now   = input.time;
@@ -120,8 +121,6 @@ impl eframe::App for ViewerApp {
                 ui.centered_and_justified(|ui| ui.label("No image loaded"));
                 return;
             }
-
-            // ▷ carve out space for top+bottom bars so the image never sits underneath them
             let full = ui.available_rect_before_wrap();
             let bar_h = if self.show_top_bar { 32.0 } else { 0.0 };
             let avail = Rect::from_min_max(
@@ -242,6 +241,11 @@ impl eframe::App for ViewerApp {
                         }
                     }
                     ui.separator();
+
+                    // capture previous state
+                    let prev_layout                = self.layout;
+                    let (prev_sort_key, prev_ascending) = (self.sort_key, self.ascending);
+
                     ui.label("View:");
                     egui::ComboBox::from_id_source("layout")
                         .selected_text(self.layout.label())
@@ -250,7 +254,7 @@ impl eframe::App for ViewerApp {
                                 ui.selectable_value(&mut self.layout, l, l.label());
                             }
                         });
-                    let (pk, pa) = (self.sort_key, self.ascending);
+
                     ui.separator();
                     ui.label("Sort by:");
                     egui::ComboBox::from_id_source("sort_key")
@@ -260,6 +264,7 @@ impl eframe::App for ViewerApp {
                                 ui.selectable_value(&mut self.sort_key, k, k.label());
                             }
                         });
+
                     ui.label("Order:");
                     egui::ComboBox::from_id_source("sort_order")
                         .selected_text(if self.ascending { "Asc" } else { "Desc" })
@@ -267,9 +272,22 @@ impl eframe::App for ViewerApp {
                             ui.selectable_value(&mut self.ascending, true, "Asc");
                             ui.selectable_value(&mut self.ascending, false, "Desc");
                         });
-                    if pk != self.sort_key || pa != self.ascending {
-                        self.sort_images();
+
+                    // apply resets
+                    if prev_layout != self.layout {
+                        self.zoom        = 1.0;
+                        self.pan         = Vec2::ZERO;
+                        self.last_cursor = None;
+                        self.zoomed_once = false;
                     }
+                    if prev_sort_key != self.sort_key || prev_ascending != self.ascending {
+                        self.sort_images();
+                        self.zoom        = 1.0;
+                        self.pan         = Vec2::ZERO;
+                        self.last_cursor = None;
+                        self.zoomed_once = false;
+                    }
+
                     ui.separator();
                     ui.add_enabled(self.has_images(), egui::Button::new("◀ Prev"))
                         .clicked().then(|| self.prev());
