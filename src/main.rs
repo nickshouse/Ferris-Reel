@@ -121,9 +121,13 @@ impl eframe::App for ViewerApp {
                 return;
             }
 
-            // shrink available rect vertically to avoid top/bottom bars
-            let y_pad = if self.show_top_bar { 32.0 } else { 0.0 };
-            let avail = ui.available_rect_before_wrap().shrink(Vec2::new(0.0, y_pad));
+            // ▷ carve out space for top+bottom bars so the image never sits underneath them
+            let full = ui.available_rect_before_wrap();
+            let bar_h = if self.show_top_bar { 32.0 } else { 0.0 };
+            let avail = Rect::from_min_max(
+                Pos2::new(full.min.x, full.min.y + bar_h),
+                Pos2::new(full.max.x, full.max.y - bar_h),
+            );
 
             if let Some(pos) = input.pointer.hover_pos() {
                 self.last_cursor = Some(pos);
@@ -169,7 +173,6 @@ impl eframe::App for ViewerApp {
                     self.last_zoom_time = now;
                 }
             } else {
-                // reset for next press
                 self.zoomed_once = false;
             }
 
@@ -301,29 +304,65 @@ impl eframe::App for ViewerApp {
 
 
 
-
-impl ViewerApp{
-    fn sort_images(&mut self){
-        let(asc,key)=(self.ascending,self.sort_key);
-        self.images.sort_by(|a,b|{
-            let ord=match key{
-                SortKey::Name=>a.name.cmp(&b.name),
-                SortKey::Created=>a.created.cmp(&b.created),
-                SortKey::Size=>a.bytes.cmp(&b.bytes),
-                SortKey::Height=>a.h.cmp(&b.h).then(a.name.cmp(&b.name)),
-                SortKey::Width=>a.w.cmp(&b.w).then(a.name.cmp(&b.name)),
-                SortKey::Type=>a.ext.cmp(&b.ext).then(a.name.cmp(&b.name)),
+impl ViewerApp {
+    fn sort_images(&mut self) {
+        let (asc, key) = (self.ascending, self.sort_key);
+        self.images.sort_by(|a, b| {
+            let ord = match key {
+                SortKey::Name    => a.name.cmp(&b.name),
+                SortKey::Created => a.created.cmp(&b.created),
+                SortKey::Size    => a.bytes.cmp(&b.bytes),
+                SortKey::Height  => a.h.cmp(&b.h).then(a.name.cmp(&b.name)),
+                SortKey::Width   => a.w.cmp(&b.w).then(a.name.cmp(&b.name)),
+                SortKey::Type    => a.ext.cmp(&b.ext).then(a.name.cmp(&b.name)),
             };
-            if asc{ord}else{ord.reverse()}
+            if asc { ord } else { ord.reverse() }
         });
-        self.current=self.current.min(self.images.len().saturating_sub(1));
+        self.current = self.current.min(self.images.len().saturating_sub(1));
     }
-    fn spawn_loader(&mut self,dir:PathBuf){self.images.clear();self.current=0;let(tx,rx)=unbounded::<ImgMsg>();self.rx=rx;self.current_dir=Some(dir.clone());rayon::spawn(move||load_directory(dir,tx));}
-    #[inline]fn has_images(&self)->bool{!self.images.is_empty()}
-    #[inline]fn current_img(&self)->Option<&ImgEntry>{self.images.get(self.current)}
-    fn next(&mut self){if self.has_images(){self.current=(self.current+1)%self.images.len();}}
-    fn prev(&mut self){if self.has_images(){self.current=(self.current+self.images.len()-1)%self.images.len();}}
+
+    fn spawn_loader(&mut self, dir: PathBuf) {
+        self.images.clear();
+        self.current = 0;
+        let (tx, rx) = unbounded::<ImgMsg>();
+        self.rx = rx;
+        self.current_dir = Some(dir.clone());
+        rayon::spawn(move || load_directory(dir, tx));
+    }
+
+    #[inline]
+    fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+
+    #[inline]
+    fn current_img(&self) -> Option<&ImgEntry> {
+        self.images.get(self.current)
+    }
+
+    fn next(&mut self) {
+        if self.has_images() {
+            self.current = (self.current + 1) % self.images.len();
+            // reset pan & zoom
+            self.zoom        = 1.0;
+            self.pan         = Vec2::ZERO;
+            self.last_cursor = None;
+            self.zoomed_once = false;
+        }
+    }
+
+    fn prev(&mut self) {
+        if self.has_images() {
+            self.current = (self.current + self.images.len() - 1) % self.images.len();
+            // reset pan & zoom
+            self.zoom        = 1.0;
+            self.pan         = Vec2::ZERO;
+            self.last_cursor = None;
+            self.zoomed_once = false;
+        }
+    }
 }
+
 fn human_bytes(b:u64)->String{
     let f=b as f64;const KB:f64=1024.0;const MB:f64=KB*1024.0;const GB:f64=MB*1024.0;
     if f>=GB{format!("{:.1} GB",f/GB)}else if f>=MB{format!("{:.1} MB",f/MB)}else if f>=KB{format!("{:.1} KB",f/KB)}else{format!("{b} B")}
