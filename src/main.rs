@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::SystemTime};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::{egui, egui::TextureHandle, NativeOptions};
-use egui::{Vec2};
+use egui::Vec2;
 use image::{DynamicImage, ImageReader};
 use rayon::prelude::*;
 use walkdir::WalkDir;
@@ -116,12 +116,12 @@ impl eframe::App for ViewerApp {
         let input = ctx.input(|i| i.clone());
         let now   = input.time;
 
-        // Alt toggles the chrome (top & bottom bars)
+        // Alt toggles chrome
         let alt = input.modifiers.alt;
         if alt && !self.prev_alt_down { self.show_top_bar = !self.show_top_bar; }
         self.prev_alt_down = alt;
 
-        // ── pull newly‑decoded images from the loader thread ──────────────
+        // ── receive decoded images ───────────────────────────────────────
         while let Ok((path, img)) = self.rx.try_recv() {
             let (w, h) = (img.width(), img.height());
             let tex = ctx.load_texture(
@@ -170,7 +170,7 @@ impl eframe::App for ViewerApp {
             if let Some(pos) = input.pointer.hover_pos() { self.last_cursor = Some(pos); }
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
-            // ── zoom with side‑buttons ───────────────────────────────────
+            // ── zoom with side buttons ───────────────────────────────────
             let zin        = input.pointer.button_down(PointerButton::Extra2);
             let zout       = input.pointer.button_down(PointerButton::Extra1);
             let zin_press  = input.pointer.button_pressed(PointerButton::Extra2);
@@ -235,6 +235,14 @@ impl eframe::App for ViewerApp {
         if self.show_top_bar {
             egui::TopBottomPanel::top("menu").show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // open single file
+                    if ui.button("Open file…").clicked() {
+                        if let Some(file) = FileDialog::new()
+                            .add_filter("Images", &["png","jpg","jpeg","bmp","gif","tiff","webp"])
+                            .pick_file()
+                        { self.spawn_loader_file(file); }
+                    }
+                    // open folder
                     if ui.button("Open folder…").clicked() {
                         if let Some(dir) = FileDialog::new().pick_folder() { self.spawn_loader(dir); }
                     }
@@ -295,7 +303,6 @@ impl eframe::App for ViewerApp {
     }
 }
 
-
 impl ViewerApp {
     fn sort_images(&mut self) {
         let (asc, key) = (self.ascending, self.sort_key);
@@ -322,11 +329,24 @@ impl ViewerApp {
         rayon::spawn(move || load_directory(dir, tx));
     }
 
-    #[inline]
-    fn has_images(&self) -> bool { !self.images.is_empty() }
+    // fixed (no unstable 'let-else' chain)
+    fn spawn_loader_file(&mut self, file: PathBuf) {
+        self.images.clear();
+        self.current = 0;
+        let (tx, rx) = unbounded::<ImgMsg>();
+        self.rx = rx;
+        self.current_dir = file.parent().map(|p| p.to_path_buf());
+        rayon::spawn(move || {
+            if let Ok(reader) = ImageReader::open(&file) {
+                if let Ok(img) = reader.decode() {
+                    let _ = tx.send((file, img));
+                }
+            }
+        });
+    }
 
-    #[inline]
-    fn current_img(&self) -> Option<&ImgEntry> { self.images.get(self.current) }
+    #[inline] fn has_images(&self) -> bool { !self.images.is_empty() }
+    #[inline] fn current_img(&self) -> Option<&ImgEntry> { self.images.get(self.current) }
 
     fn next(&mut self) {
         if self.has_images() {
@@ -335,7 +355,6 @@ impl ViewerApp {
             self.last_cursor = None; self.zoomed_once = false;
         }
     }
-
     fn prev(&mut self) {
         if self.has_images() {
             self.current = (self.current + self.images.len() - 1) % self.images.len();
@@ -345,6 +364,7 @@ impl ViewerApp {
     }
 }
 
+// ── helpers ─────────────────────────────────────────────────────────────
 fn human_bytes(b: u64) -> String {
     let f = b as f64;
     const KB: f64 = 1024.0;
