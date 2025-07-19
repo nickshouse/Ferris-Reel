@@ -1,50 +1,76 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // ← NEW
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{env, path::PathBuf, time::SystemTime};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use eframe::{egui, egui::TextureHandle, NativeOptions};
+use eframe::{
+    egui,
+    egui::{TextureHandle, ViewportBuilder},
+    NativeOptions,
+};
 use egui::Vec2;
 use image::{DynamicImage, ImageReader};
 use rayon::prelude::*;
 use walkdir::WalkDir;
+use winit::event_loop::EventLoop;
+use winit::monitor::MonitorHandle;
 
 type ImgMsg = (PathBuf, DynamicImage);
 
 fn main() -> eframe::Result<()> {
-    // pick up the first CLI arg, if any (Windows passes it on double‑click)
+    // ── monitor size & centred 75 % window ─────────────────────────────
+    let (mon_w, mon_h) = primary_monitor_logical_size()
+        .unwrap_or((1280.0, 720.0));
+    let win_w = mon_w * 0.75;
+    let win_h = mon_h * 0.75;
+    let pos_x = ((mon_w - win_w) / 2.0) as f32;
+    let pos_y = ((mon_h - win_h) / 2.0) as f32;
+
+    // file/folder handed by Windows “Open with…”
     let start_path = env::args().nth(1).map(PathBuf::from);
+
+    // viewport builder
+    let mut opts = NativeOptions::default();
+    opts.viewport = ViewportBuilder::default()
+        .with_inner_size([win_w as f32, win_h as f32])
+        .with_position([pos_x, pos_y]);
 
     eframe::run_native(
         "Rust Multicore Image Viewer",
-        NativeOptions::default(),
+        opts,
         Box::new(move |_| {
             let mut app = ViewerApp::default();
-            if let Some(p) = start_path.clone() {
-                if p.is_file() {
-                    app.spawn_loader_file(p);
-                } else if p.is_dir() {
-                    app.spawn_loader(p);
-                }
+            if let Some(p) = &start_path {
+                if p.is_file() { app.spawn_loader_file(p.clone()); }
+                else if p.is_dir() { app.spawn_loader(p.clone()); }
             }
             Box::new(app)
         }),
     )
 }
 
+/// logical (DPI‑independent) size of the primary monitor
+fn primary_monitor_logical_size() -> Option<(f64, f64)> {
+    let el = EventLoop::<()>::new();
+    let mon: MonitorHandle = el.primary_monitor()?;
+    let phys = mon.size();
+    let scale = mon.scale_factor();
+    Some((phys.width as f64 / scale, phys.height as f64 / scale))
+}
+
+/* ───────────────────────── domain types ─────────────────────────── */
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SortKey { Name, Created, Size, Height, Width, Type }
 impl SortKey {
-    fn all() -> [Self; 6] {
-        [Self::Name, Self::Created, Self::Size, Self::Height, Self::Width, Self::Type]
-    }
+    fn all() -> [Self; 6] { [Self::Name, Self::Created, Self::Size, Self::Height, Self::Width, Self::Type] }
     fn label(self) -> &'static str {
         match self {
-            Self::Name    => "Name",
+            Self::Name => "Name",
             Self::Created => "Date",
-            Self::Size    => "Size",
-            Self::Height  => "Height",
-            Self::Width   => "Width",
-            Self::Type    => "Type",
+            Self::Size => "Size",
+            Self::Height => "Height",
+            Self::Width => "Width",
+            Self::Type => "Type",
         }
     }
 }
@@ -55,13 +81,12 @@ impl Layout {
     fn all() -> [Self; 3] { [Self::One, Self::Two, Self::Three] }
     fn label(self) -> &'static str {
         match self {
-            Self::One   => "1 image",
-            Self::Two   => "2 images",
-            Self::Three => "3 images",
+            Self::One => "1 image", Self::Two => "2 images", Self::Three => "3 images",
         }
     }
 }
 
+/// Stored metadata + texture for a loaded image
 struct ImgEntry {
     name: String,
     ext: String,
@@ -71,6 +96,8 @@ struct ImgEntry {
     bytes: u64,
     created: Option<SystemTime>,
 }
+
+/* ───────────────────────── app state ─────────────────────────────── */
 
 struct ViewerApp {
     images: Vec<ImgEntry>,
@@ -116,10 +143,8 @@ impl Default for ViewerApp {
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         use std::fs;
-        use egui::{
-            PointerButton, Key, ViewportCommand, Rect, Sense, Pos2, Vec2,
-            Color32, ColorImage, CursorIcon, Label,
-        };
+        use egui::{PointerButton, Key, ViewportCommand, Rect, Sense, Pos2,
+                   Vec2, Color32, ColorImage, CursorIcon, Label};
         use rfd::FileDialog;
 
         fn no_sel(text: impl Into<egui::WidgetText>) -> Label {
@@ -127,7 +152,7 @@ impl eframe::App for ViewerApp {
         }
 
         let input = ctx.input(|i| i.clone());
-        let now   = input.time;
+        let now = input.time;
 
         // Alt toggles chrome
         let alt = input.modifiers.alt;
@@ -147,7 +172,7 @@ impl eframe::App for ViewerApp {
                 .unwrap_or((0, None));
             self.images.push(ImgEntry {
                 name: path.file_name().unwrap().to_string_lossy().into(),
-                ext:  path.extension().and_then(|s| s.to_str()).unwrap_or("").to_owned(),
+                ext: path.extension().and_then(|s| s.to_str()).unwrap_or("").to_owned(),
                 tex, w, h, bytes, created,
             });
             self.sort_images();
@@ -166,7 +191,7 @@ impl eframe::App for ViewerApp {
             _            => {}
         }
 
-        // central panel (unchanged drawing logic)  ───────────────────────
+        // central panel (drawing logic unchanged) …
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.has_images() {
                 ui.centered_and_justified(|ui| ui.add(no_sel("No image loaded")));
