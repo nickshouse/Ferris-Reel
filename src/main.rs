@@ -4,7 +4,6 @@ use eframe::{egui, egui::TextureHandle};
 use egui::Vec2;
 use image::{DynamicImage,ImageReader};
 use rayon::prelude::*;
-use rfd::FileDialog;
 use walkdir::WalkDir;
 type ImgMsg=(PathBuf,DynamicImage);
 fn main()->eframe::Result<()>{
