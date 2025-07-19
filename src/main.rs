@@ -1,4 +1,6 @@
-use std::{path::PathBuf, time::SystemTime};
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // ← NEW
+
+use std::{env, path::PathBuf, time::SystemTime};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::{egui, egui::TextureHandle, NativeOptions};
 use egui::Vec2;
@@ -9,10 +11,23 @@ use walkdir::WalkDir;
 type ImgMsg = (PathBuf, DynamicImage);
 
 fn main() -> eframe::Result<()> {
+    // pick up the first CLI arg, if any (Windows passes it on double‑click)
+    let start_path = env::args().nth(1).map(PathBuf::from);
+
     eframe::run_native(
         "Rust Multicore Image Viewer",
         NativeOptions::default(),
-        Box::new(|_| Box::<ViewerApp>::default()),
+        Box::new(move |_| {
+            let mut app = ViewerApp::default();
+            if let Some(p) = start_path.clone() {
+                if p.is_file() {
+                    app.spawn_loader_file(p);
+                } else if p.is_dir() {
+                    app.spawn_loader(p);
+                }
+            }
+            Box::new(app)
+        }),
     )
 }
 
@@ -107,12 +122,10 @@ impl eframe::App for ViewerApp {
         };
         use rfd::FileDialog;
 
-        // helper: quick non‑selectable label
         fn no_sel(text: impl Into<egui::WidgetText>) -> Label {
             Label::new(text).selectable(false)
         }
 
-        // ── input snapshot ────────────────────────────────────────────────
         let input = ctx.input(|i| i.clone());
         let now   = input.time;
 
@@ -121,7 +134,7 @@ impl eframe::App for ViewerApp {
         if alt && !self.prev_alt_down { self.show_top_bar = !self.show_top_bar; }
         self.prev_alt_down = alt;
 
-        // ── receive decoded images ───────────────────────────────────────
+        // receive decoded images
         while let Ok((path, img)) = self.rx.try_recv() {
             let (w, h) = (img.width(), img.height());
             let tex = ctx.load_texture(
@@ -140,7 +153,7 @@ impl eframe::App for ViewerApp {
             self.sort_images();
         }
 
-        // ── keyboard / wheel navigation & fullscreen ─────────────────────
+        // navigation & fullscreen
         if input.key_pressed(Key::ArrowRight) { self.next(); }
         if input.key_pressed(Key::ArrowLeft)  { self.prev(); }
         if input.key_pressed(Key::F11) {
@@ -153,10 +166,10 @@ impl eframe::App for ViewerApp {
             _            => {}
         }
 
-        // ── central drawing area ─────────────────────────────────────────
+        // central panel (unchanged drawing logic)  ───────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.has_images() {
-                ui.centered_and_justified(|ui| { ui.add(no_sel("No image loaded")); });
+                ui.centered_and_justified(|ui| ui.add(no_sel("No image loaded")));
                 return;
             }
 
@@ -170,7 +183,7 @@ impl eframe::App for ViewerApp {
             if let Some(pos) = input.pointer.hover_pos() { self.last_cursor = Some(pos); }
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
-            // ── zoom with side buttons ───────────────────────────────────
+            // zoom with side buttons
             let zin        = input.pointer.button_down(PointerButton::Extra2);
             let zout       = input.pointer.button_down(PointerButton::Extra1);
             let zin_press  = input.pointer.button_pressed(PointerButton::Extra2);
@@ -194,20 +207,17 @@ impl eframe::App for ViewerApp {
                 }
             } else { self.zoomed_once = false; }
 
-            // ── draw images ──────────────────────────────────────────────
+            // draw images …
             match self.layout {
                 Layout::One => {
-                    let img  = self.current_img().unwrap();
+                    let img = self.current_img().unwrap();
                     let base = img.tex.size_vec2();
                     let fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
-                    let size = base * fit * self.zoom;
+                    let size = base*fit*self.zoom;
                     let rect = Rect::from_center_size(avail.center()+self.pan, size);
                     let resp = ui.allocate_rect(rect, Sense::drag());
-                    ui.painter().image(
-                        img.tex.id(), rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)),
-                        Color32::WHITE,
-                    );
+                    ui.painter().image(img.tex.id(), rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)), Color32::WHITE);
                     if resp.dragged() { self.pan += resp.drag_delta(); }
                 }
                 Layout::Two | Layout::Three => {
@@ -231,18 +241,15 @@ impl eframe::App for ViewerApp {
             }
         });
 
-        // ── chrome (top menu & bottom stats) ─────────────────────────────
+        // toolbar & stats (unchanged except file/folder buttons) ─────────
         if self.show_top_bar {
             egui::TopBottomPanel::top("menu").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // open single file
                     if ui.button("Open file…").clicked() {
                         if let Some(file) = FileDialog::new()
-                            .add_filter("Images", &["png","jpg","jpeg","bmp","gif","tiff","webp"])
-                            .pick_file()
-                        { self.spawn_loader_file(file); }
+                            .add_filter("Images",&["png","jpg","jpeg","bmp","gif","tiff","webp"])
+                            .pick_file() { self.spawn_loader_file(file); }
                     }
-                    // open folder
                     if ui.button("Open folder…").clicked() {
                         if let Some(dir) = FileDialog::new().pick_folder() { self.spawn_loader(dir); }
                     }
@@ -296,7 +303,7 @@ impl eframe::App for ViewerApp {
             });
         }
 
-        // ── final cursor‑patch ───────────────────────────────────────────
+        // always reset cursor unless dragging
         ctx.output_mut(|o| if !matches!(o.cursor_icon, CursorIcon::Grab|CursorIcon::Grabbing) {
             o.cursor_icon = CursorIcon::Default;
         });
@@ -304,6 +311,8 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
+    /* sorting, navigation, and folder loader unchanged */
+
     fn sort_images(&mut self) {
         let (asc, key) = (self.ascending, self.sort_key);
         self.images.sort_by(|a, b| {
@@ -329,7 +338,6 @@ impl ViewerApp {
         rayon::spawn(move || load_directory(dir, tx));
     }
 
-    // fixed (no unstable 'let-else' chain)
     fn spawn_loader_file(&mut self, file: PathBuf) {
         self.images.clear();
         self.current = 0;
@@ -337,8 +345,8 @@ impl ViewerApp {
         self.rx = rx;
         self.current_dir = file.parent().map(|p| p.to_path_buf());
         rayon::spawn(move || {
-            if let Ok(reader) = ImageReader::open(&file) {
-                if let Ok(img) = reader.decode() {
+            if let Ok(r) = ImageReader::open(&file) {
+                if let Ok(img) = r.decode() {
                     let _ = tx.send((file, img));
                 }
             }
@@ -364,7 +372,7 @@ impl ViewerApp {
     }
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────
+// helpers
 fn human_bytes(b: u64) -> String {
     let f = b as f64;
     const KB: f64 = 1024.0;
