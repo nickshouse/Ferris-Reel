@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{env, path::PathBuf, time::SystemTime};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::{
     egui,
@@ -11,24 +15,22 @@ use egui::Vec2;
 use image::{DynamicImage, ImageReader};
 use rayon::prelude::*;
 use walkdir::WalkDir;
-use winit::event_loop::EventLoop;
-use winit::monitor::MonitorHandle;
+use winit::{event_loop::EventLoop, monitor::MonitorHandle};
 
 type ImgMsg = (PathBuf, DynamicImage);
 
-fn main() -> eframe::Result<()> {
-    // ── monitor size & centred 75 % window ─────────────────────────────
-    let (mon_w, mon_h) = primary_monitor_logical_size()
-        .unwrap_or((1280.0, 720.0));
-    let win_w = mon_w * 0.75;
-    let win_h = mon_h * 0.75;
-    let pos_x = ((mon_w - win_w) / 2.0) as f32;
-    let pos_y = ((mon_h - win_h) / 2.0) as f32;
+/* ───────────────────────── program entry ─────────────────────────── */
 
-    // file/folder handed by Windows “Open with…”
+fn main() -> eframe::Result<()> {
+    /* centred 75 % window size */
+    let (mon_w, mon_h) = primary_monitor_logical_size().unwrap_or((1280.0, 720.0));
+    let (win_w, win_h) = (mon_w * 0.75, mon_h * 0.75);
+    let (pos_x, pos_y) = (((mon_w - win_w) / 2.0) as f32, ((mon_h - win_h) / 2.0) as f32);
+
+    /* file / folder supplied by OS on double‑click */
     let start_path = env::args().nth(1).map(PathBuf::from);
 
-    // viewport builder
+    /* viewport */
     let mut opts = NativeOptions::default();
     opts.viewport = ViewportBuilder::default()
         .with_inner_size([win_w as f32, win_h as f32])
@@ -40,8 +42,11 @@ fn main() -> eframe::Result<()> {
         Box::new(move |_| {
             let mut app = ViewerApp::default();
             if let Some(p) = &start_path {
-                if p.is_file() { app.spawn_loader_file(p.clone()); }
-                else if p.is_dir() { app.spawn_loader(p.clone()); }
+                if p.is_file() {
+                    app.spawn_loader_file(p.clone());
+                } else if p.is_dir() {
+                    app.spawn_loader(p.clone());
+                }
             }
             Box::new(app)
         }),
@@ -60,9 +65,25 @@ fn primary_monitor_logical_size() -> Option<(f64, f64)> {
 /* ───────────────────────── domain types ─────────────────────────── */
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SortKey { Name, Created, Size, Height, Width, Type }
+enum SortKey {
+    Name,
+    Created,
+    Size,
+    Height,
+    Width,
+    Type,
+}
 impl SortKey {
-    fn all() -> [Self; 6] { [Self::Name, Self::Created, Self::Size, Self::Height, Self::Width, Self::Type] }
+    fn all() -> [Self; 6] {
+        [
+            Self::Name,
+            Self::Created,
+            Self::Size,
+            Self::Height,
+            Self::Width,
+            Self::Type,
+        ]
+    }
     fn label(self) -> &'static str {
         match self {
             Self::Name => "Name",
@@ -76,12 +97,20 @@ impl SortKey {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Layout { One, Two, Three }
+enum Layout {
+    One,
+    Two,
+    Three,
+}
 impl Layout {
-    fn all() -> [Self; 3] { [Self::One, Self::Two, Self::Three] }
+    fn all() -> [Self; 3] {
+        [Self::One, Self::Two, Self::Three]
+    }
     fn label(self) -> &'static str {
         match self {
-            Self::One => "1 image", Self::Two => "2 images", Self::Three => "3 images",
+            Self::One => "1 image",
+            Self::Two => "2 images",
+            Self::Three => "3 images",
         }
     }
 }
@@ -104,6 +133,7 @@ struct ViewerApp {
     current: usize,
     rx: Receiver<ImgMsg>,
     current_dir: Option<PathBuf>,
+    /* UI state */
     is_fullscreen: bool,
     sort_key: SortKey,
     ascending: bool,
@@ -115,6 +145,8 @@ struct ViewerApp {
     last_zoom_time: f64,
     last_cursor: Option<egui::Pos2>,
     zoomed_once: bool,
+    /* remember file that launched the app so we can re‑select it */
+    pending_target: Option<String>,
 }
 
 impl Default for ViewerApp {
@@ -136,16 +168,21 @@ impl Default for ViewerApp {
             last_zoom_time: 0.0,
             last_cursor: None,
             zoomed_once: false,
+            pending_target: None,
         }
     }
 }
 
+/* ───────────────────────── UI (update) ───────────────────────────── */
+
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        use std::fs;
-        use egui::{PointerButton, Key, ViewportCommand, Rect, Sense, Pos2,
-                   Vec2, Color32, ColorImage, CursorIcon, Label};
+        use egui::{
+            Color32, ColorImage, CursorIcon, Key, Label, PointerButton, Pos2, Rect, Sense, Vec2,
+            ViewportCommand,
+        };
         use rfd::FileDialog;
+        use std::fs;
 
         fn no_sel(text: impl Into<egui::WidgetText>) -> Label {
             Label::new(text).selectable(false)
@@ -154,12 +191,14 @@ impl eframe::App for ViewerApp {
         let input = ctx.input(|i| i.clone());
         let now = input.time;
 
-        // Alt toggles chrome
+        /* Alt toggles chrome */
         let alt = input.modifiers.alt;
-        if alt && !self.prev_alt_down { self.show_top_bar = !self.show_top_bar; }
+        if alt && !self.prev_alt_down {
+            self.show_top_bar = !self.show_top_bar;
+        }
         self.prev_alt_down = alt;
 
-        // receive decoded images
+        /* receive decoded images --------------------------------------------------- */
         while let Ok((path, img)) = self.rx.try_recv() {
             let (w, h) = (img.width(), img.height());
             let tex = ctx.load_texture(
@@ -173,12 +212,23 @@ impl eframe::App for ViewerApp {
             self.images.push(ImgEntry {
                 name: path.file_name().unwrap().to_string_lossy().into(),
                 ext: path.extension().and_then(|s| s.to_str()).unwrap_or("").to_owned(),
-                tex, w, h, bytes, created,
+                tex,
+                w,
+                h,
+                bytes,
+                created,
             });
             self.sort_images();
+
+            /* keep the clicked file selected after sort */
+            if let Some(tgt) = &self.pending_target {
+                if let Some(pos) = self.images.iter().position(|e| &e.name == tgt) {
+                    self.current = pos;
+                }
+            }
         }
 
-        // navigation & fullscreen
+        /* navigation & fullscreen */
         if input.key_pressed(Key::ArrowRight) { self.next(); }
         if input.key_pressed(Key::ArrowLeft)  { self.prev(); }
         if input.key_pressed(Key::F11) {
@@ -188,10 +238,10 @@ impl eframe::App for ViewerApp {
         match input.raw_scroll_delta.y {
             d if d > 0.0 => self.prev(),
             d if d < 0.0 => self.next(),
-            _            => {}
+            _ => {}
         }
 
-        // central panel (drawing logic unchanged) …
+        /* central panel ----------------------------------------------------------- */
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.has_images() {
                 ui.centered_and_justified(|ui| ui.add(no_sel("No image loaded")));
@@ -208,13 +258,16 @@ impl eframe::App for ViewerApp {
             if let Some(pos) = input.pointer.hover_pos() { self.last_cursor = Some(pos); }
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
-            // zoom with side buttons
+            /* zoom with side‑buttons */
             let zin        = input.pointer.button_down(PointerButton::Extra2);
             let zout       = input.pointer.button_down(PointerButton::Extra1);
             let zin_press  = input.pointer.button_pressed(PointerButton::Extra2);
             let zout_press = input.pointer.button_pressed(PointerButton::Extra1);
 
-            if zin || zout {
+            /* ← NEW: true while *either* zoom key is held */
+            let zoom_active = zin || zout;
+
+            if zoom_active {
                 ctx.request_repaint();
                 let bump = |old: f32, up: bool| (old * if up { 1.1 } else { 1.0 / 1.1 }).clamp(0.1, 10.0);
                 let apply = |s: &mut Self, new: f32| {
@@ -232,36 +285,43 @@ impl eframe::App for ViewerApp {
                 }
             } else { self.zoomed_once = false; }
 
-            // draw images …
+            /* draw images */
             match self.layout {
                 Layout::One => {
-                    let img = self.current_img().unwrap();
+                    let img  = self.current_img().unwrap();
                     let base = img.tex.size_vec2();
                     let fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
                     let size = base*fit*self.zoom;
                     let rect = Rect::from_center_size(avail.center()+self.pan, size);
                     let resp = ui.allocate_rect(rect, Sense::drag());
-                    ui.painter().image(img.tex.id(), rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)), Color32::WHITE);
-                    if resp.dragged() { self.pan += resp.drag_delta(); }
+                    ui.painter().image(
+                        img.tex.id(), rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)),
+                        Color32::WHITE,
+                    );
+                    if resp.dragged() && !zoom_active {    // ← NEW
+                        self.pan += resp.drag_delta();
+                    }
                 }
                 Layout::Two | Layout::Three => {
-                    let cnt = if self.layout==Layout::Two {2} else {3};
-                    let mut items = Vec::with_capacity(cnt);
+                    let cnt   = if self.layout==Layout::Two { 2 } else { 3 };
+                    let mut v = Vec::with_capacity(cnt);
                     for i in 0..cnt {
-                        let img = &self.images[(self.current+i)%self.images.len()];
-                        let base= img.tex.size_vec2();
-                        let fit = (avail.width()/(cnt as f32)/base.x).min(avail.height()/base.y).min(1.0);
-                        items.push((img.tex.id(), base*fit*self.zoom));
+                        let img  = &self.images[(self.current+i)%self.images.len()];
+                        let base = img.tex.size_vec2();
+                        let fit  = (avail.width()/(cnt as f32)/base.x).min(avail.height()/base.y).min(1.0);
+                        v.push((img.tex.id(), base*fit*self.zoom));
                     }
-                    let total_w: f32 = items.iter().map(|(_,s)|s.x).sum();
-                    let total_h: f32 = items.iter().map(|(_,s)|s.y).fold(0.0, f32::max);
+                    let total_w: f32 = v.iter().map(|(_,s)|s.x).sum();
+                    let total_h: f32 = v.iter().map(|(_,s)|s.y).fold(0.0, f32::max);
                     let rect = Rect::from_center_size(avail.center()+self.pan, Vec2::new(total_w,total_h));
                     let resp = ui.allocate_rect(rect, Sense::drag());
                     ui.allocate_ui_at_rect(rect, |ui| {
-                        ui.horizontal_centered(|ui| for (id,sz) in items { ui.image((id,sz)); });
+                        ui.horizontal_centered(|ui| for (id,sz) in v { ui.image((id,sz)); });
                     });
-                    if resp.dragged() { self.pan += resp.drag_delta(); }
+                    if resp.dragged() && !zoom_active {    // ← NEW
+                        self.pan += resp.drag_delta();
+                    }
                 }
             }
         });
@@ -328,7 +388,6 @@ impl eframe::App for ViewerApp {
             });
         }
 
-        // always reset cursor unless dragging
         ctx.output_mut(|o| if !matches!(o.cursor_icon, CursorIcon::Grab|CursorIcon::Grabbing) {
             o.cursor_icon = CursorIcon::Default;
         });
@@ -336,24 +395,27 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
-    /* sorting, navigation, and folder loader unchanged */
-
     fn sort_images(&mut self) {
         let (asc, key) = (self.ascending, self.sort_key);
         self.images.sort_by(|a, b| {
             let ord = match key {
-                SortKey::Name    => a.name.cmp(&b.name),
+                SortKey::Name => a.name.cmp(&b.name),
                 SortKey::Created => a.created.cmp(&b.created),
-                SortKey::Size    => a.bytes.cmp(&b.bytes),
-                SortKey::Height  => a.h.cmp(&b.h).then(a.name.cmp(&b.name)),
-                SortKey::Width   => a.w.cmp(&b.w).then(a.name.cmp(&b.name)),
-                SortKey::Type    => a.ext.cmp(&b.ext).then(a.name.cmp(&b.name)),
+                SortKey::Size => a.bytes.cmp(&b.bytes),
+                SortKey::Height => a.h.cmp(&b.h).then(a.name.cmp(&b.name)),
+                SortKey::Width => a.w.cmp(&b.w).then(a.name.cmp(&b.name)),
+                SortKey::Type => a.ext.cmp(&b.ext).then(a.name.cmp(&b.name)),
             };
-            if asc { ord } else { ord.reverse() }
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
         });
         self.current = self.current.min(self.images.len().saturating_sub(1));
     }
 
+    /// Load **all** images in a directory (recursive).
     fn spawn_loader(&mut self, dir: PathBuf) {
         self.images.clear();
         self.current = 0;
@@ -363,50 +425,76 @@ impl ViewerApp {
         rayon::spawn(move || load_directory(dir, tx));
     }
 
+    /// Open a single image: load its whole folder and keep its name in `pending_target`.
     fn spawn_loader_file(&mut self, file: PathBuf) {
-        self.images.clear();
-        self.current = 0;
-        let (tx, rx) = unbounded::<ImgMsg>();
-        self.rx = rx;
-        self.current_dir = file.parent().map(|p| p.to_path_buf());
-        rayon::spawn(move || {
-            if let Ok(r) = ImageReader::open(&file) {
-                if let Ok(img) = r.decode() {
-                    let _ = tx.send((file, img));
+        if let Some(parent) = file.parent().map(Path::to_path_buf) {
+            self.pending_target = file
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_owned());
+            self.spawn_loader(parent);
+        } else {
+            /* fallback single‑file load */
+            self.images.clear();
+            self.current = 0;
+            let (tx, rx) = unbounded::<ImgMsg>();
+            self.rx = rx;
+            self.current_dir = None;
+            rayon::spawn(move || {
+                if let Ok(r) = ImageReader::open(&file) {
+                    if let Ok(img) = r.decode() {
+                        let _ = tx.send((file, img));
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
-    #[inline] fn has_images(&self) -> bool { !self.images.is_empty() }
-    #[inline] fn current_img(&self) -> Option<&ImgEntry> { self.images.get(self.current) }
+    #[inline]
+    fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+    #[inline]
+    fn current_img(&self) -> Option<&ImgEntry> {
+        self.images.get(self.current)
+    }
 
     fn next(&mut self) {
         if self.has_images() {
             self.current = (self.current + 1) % self.images.len();
-            self.zoom = 1.0; self.pan = Vec2::ZERO;
-            self.last_cursor = None; self.zoomed_once = false;
+            self.zoom = 1.0;
+            self.pan = Vec2::ZERO;
+            self.last_cursor = None;
+            self.zoomed_once = false;
         }
     }
     fn prev(&mut self) {
         if self.has_images() {
             self.current = (self.current + self.images.len() - 1) % self.images.len();
-            self.zoom = 1.0; self.pan = Vec2::ZERO;
-            self.last_cursor = None; self.zoomed_once = false;
+            self.zoom = 1.0;
+            self.pan = Vec2::ZERO;
+            self.last_cursor = None;
+            self.zoomed_once = false;
         }
     }
 }
 
-// helpers
+/* ───────────────────────── misc helpers ──────────────────────────── */
+
 fn human_bytes(b: u64) -> String {
     let f = b as f64;
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
-    if f >= GB { format!("{:.1} GB", f / GB) }
-    else if f >= MB { format!("{:.1} MB", f / MB) }
-    else if f >= KB { format!("{:.1} KB", f / KB) }
-    else { format!("{b} B") }
+    if f >= GB {
+        format!("{:.1} GB", f / GB)
+    } else if f >= MB {
+        format!("{:.1} MB", f / MB)
+    } else if f >= KB {
+        format!("{:.1} KB", f / KB)
+    } else {
+        format!("{b} B")
+    }
 }
 
 fn load_directory(dir: PathBuf, tx: Sender<ImgMsg>) {
