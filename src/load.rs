@@ -1,0 +1,405 @@
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::SystemTime,
+};
+
+use crossbeam_channel::{Receiver, Sender};
+use eframe::egui;
+use image::{DynamicImage, ImageReader};
+
+/* ───────────────────────── channel types / caps ─────────────────── */
+
+/// (path, w, h, rgba, bytes, created)
+pub type ImgMsg  = (PathBuf, usize, usize, Vec<u8>, u64, Option<SystemTime>);
+/// (generation_id, path) — workers drop jobs whose gen_id != current
+pub type JobMsg  = (u64, PathBuf);
+/// discovered path
+pub type PathMsg = PathBuf;
+
+// Suggested capacities (match previous behavior)
+pub const IMG_CHAN_CAP: usize   = 1024;
+pub const PATHS_CHAN_CAP: usize = 8192;
+
+// Back-pressure for decode job queue
+pub const MAX_ENQUEUED_JOBS: usize = 2048;
+
+/* ───────────────────────── prefetch tuneables ───────────────────── */
+
+/// How far around the prefetch center to walk (lightweight order).
+pub const PREFETCH_RADIUS: usize = 512;
+
+/// How many items to attempt to enqueue per scheduler tick.
+pub const PREFETCH_PER_TICK: usize = 64;
+
+/* ───────────────────────── queue state (dedupe) ─────────────────── */
+
+/// Tracks which paths we've already uploaded (seen) and which are enqueued for decode.
+#[derive(Default)]
+pub struct QueueState {
+    pub seen: HashSet<PathBuf>,
+    pub enqueued: HashSet<PathBuf>,
+}
+
+impl QueueState {
+    #[inline]
+    pub fn clear(&mut self) {
+        self.seen.clear();
+        self.enqueued.clear();
+    }
+
+    /// Mark a decoded path as seen (after texture upload, etc.).
+    #[inline]
+    pub fn mark_seen(&mut self, path: &PathBuf) {
+        self.seen.insert(path.clone());
+        // Once seen, it's no longer considered "enqueued only".
+        self.enqueued.remove(path);
+    }
+
+    /// Attempt to enqueue `path` if it's neither seen nor already enqueued.
+    /// Returns true if enqueued.
+    #[inline]
+    pub fn try_enqueue_unique(&mut self, job_tx: &Sender<JobMsg>, gen_id: u64, path: PathBuf) -> bool {
+        if self.seen.contains(&path) || self.enqueued.contains(&path) { return false; }
+        if job_tx.try_send((gen_id, path.clone())).is_ok() {
+            self.enqueued.insert(path);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/* ───────────────────────── prefetch scheduler ───────────────────── */
+
+/// Minimal, GUI-agnostic prefetch state machine.
+#[derive(Debug, Clone)]
+pub struct Prefetcher {
+    pub center_idx: usize,
+    pub step: isize,
+    pub dirty: bool,
+    pub radius: usize,
+}
+
+impl Default for Prefetcher {
+    fn default() -> Self {
+        Self { center_idx: 0, step: 0, dirty: true, radius: PREFETCH_RADIUS }
+    }
+}
+
+impl Prefetcher {
+    #[inline]
+    pub fn new(radius: usize) -> Self {
+        Self { radius, ..Default::default() }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.center_idx = 0;
+        self.step = 0;
+        self.dirty = true;
+    }
+
+    /// Recenter around a known index (computed by the GUI or caller).
+    #[inline]
+    pub fn recenter_to(&mut self, idx: usize) {
+        self.center_idx = idx;
+        self.step = 0;
+        self.dirty = true;
+    }
+
+    /// Convenience: derive center index from either the current path or a pending target name,
+    /// falling back to the first file.
+    ///
+    /// `index_of` is a map from path -> index in `files`. If you already maintain this in the UI,
+    /// pass it through; otherwise you can build it cheaply once per refresh.
+    pub fn recenter(
+        &mut self,
+        files: &[PathBuf],
+        current_path: Option<&PathBuf>,
+        pending_target_name: Option<&str>,
+        index_of: &HashMap<PathBuf, usize>,
+    ) {
+        let idx = if let Some(cp) = current_path {
+            index_of.get(cp).copied()
+        } else if let Some(name) = pending_target_name {
+            files.iter().position(|p| p.file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s == name)
+                .unwrap_or(false))
+        } else {
+            Some(0)
+        }.unwrap_or(0);
+
+        self.recenter_to(idx);
+    }
+
+    /// Walk outward from `center_idx` in the sequence: 0, +1, -1, +2, -2, ...
+    /// Enqueue up to `max_to_enqueue` new decode jobs into `job_tx`, respecting `qstate`.
+    ///
+    /// Returns the number of paths newly enqueued this tick.
+    pub fn tick(
+        &mut self,
+        files: &[PathBuf],
+        qstate: &mut QueueState,
+        job_tx: &Sender<JobMsg>,
+        max_to_enqueue: usize,
+        max_enqueued_jobs: usize,
+        gen_id: u64,
+    ) -> usize {
+        if !self.dirty || files.is_empty() { return 0; }
+        if job_tx.len() >= max_enqueued_jobs { return 0; }
+
+        let mut emitted = 0usize;
+        while emitted < max_to_enqueue {
+            let step_abs = self.step.unsigned_abs();
+            if step_abs > self.radius { break; }
+
+            let idx = if self.step == 0 {
+                self.center_idx as isize
+            } else {
+                self.center_idx as isize + self.step
+            };
+
+            // Next step: 0 → +1 → -1 → +2 → -2 → ...
+            self.step = if self.step <= 0 { -self.step + 1 } else { -self.step };
+
+            if idx < 0 || (idx as usize) >= files.len() { continue; }
+            let path = &files[idx as usize];
+
+            if qstate.seen.contains(path) || qstate.enqueued.contains(path) { continue; }
+            if job_tx.len() >= max_enqueued_jobs { break; }
+            if qstate.try_enqueue_unique(job_tx, gen_id, path.clone()) {
+                emitted += 1;
+            }
+        }
+
+        if emitted == 0 || self.step.unsigned_abs() > self.radius {
+            self.dirty = false;
+        }
+        emitted
+    }
+}
+
+/* ───────────────────────── decoding / workers ───────────────────── */
+
+fn suggested_decoder_threads() -> usize {
+    // Favor CPU usage for compressed formats but avoid saturating all cores.
+    // Good defaults: min 2, max 12, ~2/3 of logical cores.
+    const MIN: usize = 2;
+    const MAX: usize = 12;
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let target = (logical * 2) / 3; // e.g., 16 cores -> 10 decoders
+    target.clamp(MIN, MAX)
+}
+
+#[cfg(windows)]
+fn open_file_sequential(path: &PathBuf) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_SEQUENTIAL_SCAN
+    const SEQ: u32 = 0x0800_0000;
+    OpenOptions::new().read(true).custom_flags(SEQ).open(path)
+}
+
+#[cfg(windows)]
+fn try_decode_with_hint(path: &PathBuf) -> Result<DynamicImage, ()> {
+    use std::io::BufReader;
+    let f = open_file_sequential(path).map_err(|_| ())?;
+    let fmt = image::ImageFormat::from_path(path).map_err(|_| ())?;
+    ImageReader::with_format(BufReader::new(f), fmt).decode().map_err(|_| ())
+}
+
+#[cfg(not(windows))]
+fn try_decode_with_hint(_path: &PathBuf) -> Result<DynamicImage, ()> {
+    Err(())
+}
+
+fn decode_image(path: &PathBuf) -> Result<DynamicImage, ()> {
+    // On Windows, attempt sequential-hint; fallback to normal open.
+    try_decode_with_hint(path).or_else(|_| ImageReader::open(path).map_err(|_| ())?.decode().map_err(|_| ()))
+}
+
+/// Decode at original size into RGBA
+pub fn decode_full_rgba(path: &PathBuf) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
+    let img = decode_image(path)?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    let meta = std::fs::metadata(path).ok();
+    let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let created = meta.and_then(|m| m.created().ok());
+    Ok((w, h, rgba.into_raw(), bytes, created))
+}
+
+/// Decode and optionally downscale to fit within `max_dim`.
+pub fn decode_full_rgba_downscaled(path: &PathBuf, max_dim: u32) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
+    use image::imageops::FilterType;
+
+    let img = decode_image(path)?;
+    let (w, h) = (img.width(), img.height());
+
+    let meta = std::fs::metadata(path).ok();
+    let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let created = meta.and_then(|m| m.created().ok());
+
+    if w.max(h) <= max_dim {
+        let rgba = img.to_rgba8();
+        return Ok((w as usize, h as usize, rgba.into_raw(), bytes, created));
+    }
+
+    let (nw, nh) = if w >= h {
+        let nw = max_dim;
+        let nh = ((h as f32) * (max_dim as f32 / w as f32)).round() as u32;
+        (nw, nh)
+    } else {
+        let nh = max_dim;
+        let nw = ((w as f32) * (max_dim as f32 / h as f32)).round() as u32;
+        (nw, nh)
+    };
+
+    let resized = img.resize(nw, nh, FilterType::Triangle).to_rgba8();
+    Ok((resized.width() as usize, resized.height() as usize, resized.into_raw(), bytes, created))
+}
+
+/// Start decoder workers on a dedicated Rayon pool (optional high-priority queue).
+/// If `use_downscaled` is true, workers decode previews up to `max_dim`.
+pub fn start_decoder_workers_pool(
+    job_rx: Receiver<JobMsg>,
+    prio_job_rx: Option<Receiver<JobMsg>>,
+    img_tx: Sender<ImgMsg>,
+    egui_ctx: egui::Context,
+    current_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    threads: usize,
+    use_downscaled: bool,
+    max_dim: u32,
+) {
+    use rayon::ThreadPoolBuilder;
+    use std::sync::atomic::Ordering;
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads.max(2))
+        .thread_name(|i| format!("decoder-{}", i))
+        .build()
+        .expect("build decoder pool");
+
+    let prio_rx = prio_job_rx; // move into closure
+    for _ in 0..threads.max(2) {
+        let rx = job_rx.clone();
+        let prx = prio_rx.clone();
+        let tx = img_tx.clone();
+        let ctx = egui_ctx.clone();
+        let gen = current_gen.clone();
+
+        pool.spawn(move || {
+            loop {
+                // Try priority first if present
+                let job = if let Some(ref pr) = prx {
+                    match pr.try_recv() {
+                        Ok(j) => Some(j),
+                        Err(_) => match rx.recv() { Ok(j) => Some(j), Err(_) => None }
+                    }
+                } else {
+                    match rx.recv() { Ok(j) => Some(j), Err(_) => None }
+                };
+
+                // FIXED: one extra ')' was here
+                let Some((job_gen, path)) = job else { break; };
+
+                // Drop stale work
+                if job_gen != gen.load(Ordering::Relaxed) { continue; }
+
+                let decoded = if use_downscaled {
+                    decode_full_rgba_downscaled(&path, max_dim)
+                } else {
+                    decode_full_rgba(&path)
+                };
+
+                if let Ok((w, h, rgba, bytes, created)) = decoded {
+                    // Still current?
+                    if job_gen != gen.load(Ordering::Relaxed) { continue; }
+                    let _ = tx.send((path, w, h, rgba, bytes, created));
+                    ctx.request_repaint();
+                }
+            }
+        });
+        // FIXED: this line now closes `pool.spawn(...)` correctly (was `};`)
+    }
+}
+
+/* ───────────────────────── filesystem enumeration ───────────────── */
+
+pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::Context) {
+    use std::ffi::OsStr;
+    use jwalk::{Parallelism, WalkDir};
+
+    #[inline]
+    fn is_img_ext(path: &PathBuf) -> bool {
+        match path.extension().and_then(OsStr::to_str).map(|s| s.to_ascii_lowercase()) {
+            Some(ref e) if matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tiff" | "webp") => true,
+            _ => false,
+        }
+    }
+
+    // Use a modest thread count: IO-bound; don't starve CPU decoders.
+    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).min(8);
+
+    // Walk in parallel and batch-dispatch matches to reduce contention.
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<PathBuf>>(threads * 2);
+    std::thread::spawn(move || {
+        let mut batch = Vec::with_capacity(256);
+
+        WalkDir::new(dir)
+            .follow_links(false)
+            .sort(false)
+            .skip_hidden(true)
+            // .content_first(false) // <-- not available in jwalk 0.8; remove
+            .parallelism(Parallelism::RayonNewPool(threads))
+            .into_iter()
+            .for_each(|entry| {
+                if let Ok(e) = entry {
+                    if e.file_type().is_file() {
+                        let p: PathBuf = e.path().to_path_buf();
+                        if is_img_ext(&p) {
+                            batch.push(p);
+                            if batch.len() >= 256 {
+                                let mut out = Vec::new();
+                                std::mem::swap(&mut out, &mut batch);
+                                let _ = batch_tx.send(out);
+                            }
+                        }
+                    }
+                }
+            });
+
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch);
+        }
+        // drop(batch_tx) when thread exits closes the channel
+    });
+
+    // Drain batches into the GUI channel with less contention; repaint occasionally
+    let mut total = 0usize;
+    while let Ok(mut batch) = batch_rx.recv() {
+        total += batch.len();
+        for p in batch.drain(..) {
+            let _ = paths_tx.send(p);
+        }
+        if total % 512 == 0 { egui_ctx.request_repaint(); }
+    }
+    egui_ctx.request_repaint();
+}
+
+/* ───────────────────────── optional: channel factory ────────────── */
+
+/// Convenience for keeping channel creation out of the UI layer.
+pub fn new_channels() -> (
+    Sender<ImgMsg>,   Receiver<ImgMsg>,
+    Sender<PathMsg>,  Receiver<PathMsg>,
+    Sender<JobMsg>,   Receiver<JobMsg>,
+) {
+    use crossbeam_channel::bounded;
+    let (img_tx,   img_rx)   = bounded::<ImgMsg>(IMG_CHAN_CAP);
+    let (paths_tx, paths_rx) = bounded::<PathMsg>(PATHS_CHAN_CAP);
+    let (job_tx,   job_rx)   = bounded::<JobMsg>(MAX_ENQUEUED_JOBS);
+    (img_tx, img_rx, paths_tx, paths_rx, job_tx, job_rx)
+}
