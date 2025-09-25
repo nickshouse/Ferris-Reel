@@ -183,15 +183,15 @@ impl Prefetcher {
 
 /* ───────────────────────── decoding / workers ───────────────────── */
 
+// ── keep this private; we’ll use it below so it’s not dead code anymore
 fn suggested_decoder_threads() -> usize {
-    // Favor CPU usage for compressed formats but avoid saturating all cores.
-    // Good defaults: min 2, max 12, ~2/3 of logical cores.
     const MIN: usize = 2;
     const MAX: usize = 12;
     let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let target = (logical * 2) / 3; // e.g., 16 cores -> 10 decoders
+    let target = (logical * 2) / 3;
     target.clamp(MIN, MAX)
 }
+
 
 #[cfg(windows)]
 fn open_file_sequential(path: &PathBuf) -> std::io::Result<std::fs::File> {
@@ -261,8 +261,6 @@ pub fn decode_full_rgba_downscaled(path: &PathBuf, max_dim: u32) -> Result<(usiz
     Ok((resized.width() as usize, resized.height() as usize, resized.into_raw(), bytes, created))
 }
 
-/// Start decoder workers on a dedicated Rayon pool (optional high-priority queue).
-/// If `use_downscaled` is true, workers decode previews up to `max_dim`.
 pub fn start_decoder_workers_pool(
     job_rx: Receiver<JobMsg>,
     prio_job_rx: Option<Receiver<JobMsg>>,
@@ -276,14 +274,17 @@ pub fn start_decoder_workers_pool(
     use rayon::ThreadPoolBuilder;
     use std::sync::atomic::Ordering;
 
+    // NEW: pick a sensible default if caller passes 0
+    let effective_threads = if threads == 0 { suggested_decoder_threads() } else { threads };
+
     let pool = ThreadPoolBuilder::new()
-        .num_threads(threads.max(2))
+        .num_threads(effective_threads.max(2))
         .thread_name(|i| format!("decoder-{}", i))
         .build()
         .expect("build decoder pool");
 
-    let prio_rx = prio_job_rx; // move into closure
-    for _ in 0..threads.max(2) {
+    let prio_rx = prio_job_rx;
+    for _ in 0..effective_threads.max(2) {
         let rx = job_rx.clone();
         let prx = prio_rx.clone();
         let tx = img_tx.clone();
@@ -292,7 +293,6 @@ pub fn start_decoder_workers_pool(
 
         pool.spawn(move || {
             loop {
-                // Try priority first if present
                 let job = if let Some(ref pr) = prx {
                     match pr.try_recv() {
                         Ok(j) => Some(j),
@@ -302,10 +302,8 @@ pub fn start_decoder_workers_pool(
                     match rx.recv() { Ok(j) => Some(j), Err(_) => None }
                 };
 
-                // FIXED: one extra ')' was here
                 let Some((job_gen, path)) = job else { break; };
 
-                // Drop stale work
                 if job_gen != gen.load(Ordering::Relaxed) { continue; }
 
                 let decoded = if use_downscaled {
@@ -315,16 +313,15 @@ pub fn start_decoder_workers_pool(
                 };
 
                 if let Ok((w, h, rgba, bytes, created)) = decoded {
-                    // Still current?
                     if job_gen != gen.load(Ordering::Relaxed) { continue; }
                     let _ = tx.send((path, w, h, rgba, bytes, created));
                     ctx.request_repaint();
                 }
             }
         });
-        // FIXED: this line now closes `pool.spawn(...)` correctly (was `};`)
     }
 }
+
 
 /* ───────────────────────── filesystem enumeration ───────────────── */
 
@@ -392,6 +389,7 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
 /* ───────────────────────── optional: channel factory ────────────── */
 
 /// Convenience for keeping channel creation out of the UI layer.
+#[allow(dead_code)]  // silence warning if not used by the binary
 pub fn new_channels() -> (
     Sender<ImgMsg>,   Receiver<ImgMsg>,
     Sender<PathMsg>,  Receiver<PathMsg>,

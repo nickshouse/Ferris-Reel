@@ -99,6 +99,7 @@ pub struct ViewerApp {
     is_borderless_fs: bool,
     prev_win_pos: Option<egui::Pos2>,
     prev_win_size: Option<egui::Vec2>,
+    prev_win_maximized: Option<bool>, // remember if window was maximized
 
     sort_key: SortKey,
     ascending: bool,
@@ -110,6 +111,12 @@ pub struct ViewerApp {
 
     // Remember previous chrome visibility when entering fullscreen
     prev_chrome_visible: Option<bool>,
+
+    // Ignore panning for a single frame after reset/toggle
+    suppress_drag_once: bool,
+
+    // Ignore panning until all pointer buttons are released after a toggle
+    suppress_drag_until_release: bool,
 
     zoom: f32,
     pan: Vec2,
@@ -140,7 +147,8 @@ impl ViewerApp {
             job_tx_prio, job_rx_prio,
 
             qstate: load::QueueState::default(),
-            prefetch: load::Prefetcher::default(),
+            // use Prefetcher::new so it's not dead code
+            prefetch: load::Prefetcher::new(64),
             current_gen: Arc::new(AtomicU64::new(1)),
 
             current_dir: None,
@@ -148,6 +156,7 @@ impl ViewerApp {
             is_borderless_fs: false,
             prev_win_pos: None,
             prev_win_size: None,
+            prev_win_maximized: None,
 
             sort_key: SortKey::Name,
             ascending: true,
@@ -157,6 +166,8 @@ impl ViewerApp {
             prev_alt_down: false,
             prev_chrome_visible: None,
 
+            suppress_drag_once: false,
+            suppress_drag_until_release: false,
             zoom: 1.0,
             pan: Vec2::ZERO,
             last_cursor: None,
@@ -226,8 +237,16 @@ impl ViewerApp {
         self.prefetch.dirty = true;
     }
 
+    #[inline]
+    fn reset_view_like_new(&mut self) {
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
+        self.last_cursor = None;
+        self.suppress_drag_once = true; // avoid drag delta in same frame
+    }
+
     fn toggle_borderless_fullscreen(&mut self, ctx: &egui::Context) {
-        let (cur_pos, cur_size, monitor_size) = ctx.input(|i| {
+        let (cur_pos, cur_size, monitor_size, was_maximized) = ctx.input(|i| {
             let vp = &i.viewport();
             let cur_pos  = vp
                 .outer_rect
@@ -235,21 +254,30 @@ impl ViewerApp {
                 .min;
             let cur_size = vp.inner_rect.unwrap_or(i.screen_rect()).size();
             let mon_size = vp.monitor_size.unwrap_or(i.screen_rect().size());
-            (cur_pos, cur_size, mon_size)
+            // Best-effort read of maximize state (defaults to false if unknown)
+            let was_maximized = vp.maximized.unwrap_or(false);
+            (cur_pos, cur_size, mon_size, was_maximized)
         });
 
-        // Reset/center the image every time we toggle
-        self.zoom = 1.0;
-        self.pan = Vec2::ZERO;
-        self.last_cursor = None;
+        // Reset/center the image exactly like when switching images
+        self.reset_view_like_new();
+        // Also stop any pan deltas until the user releases mouse/touch
+        self.suppress_drag_until_release = true;
 
         if !self.is_borderless_fs {
-            // Entering fullscreen: hide chrome, remember previous chrome state
+            // Entering fullscreen: hide chrome, remember previous chrome/max state
             self.prev_chrome_visible = Some(self.show_top_bar);
             self.show_top_bar = false;
 
-            self.prev_win_pos  = Some(cur_pos);
-            self.prev_win_size = Some(cur_size);
+            self.prev_win_pos        = Some(cur_pos);
+            self.prev_win_size       = Some(cur_size);
+            self.prev_win_maximized  = Some(was_maximized);
+
+            // If currently maximized, unmaximize first so size/position commands take effect
+            if was_maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            }
+
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor_size));
@@ -263,10 +291,20 @@ impl ViewerApp {
             }
 
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-            if let Some(s) = self.prev_win_size { ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(s)); }
-            if let Some(p) = self.prev_win_pos  { ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p)); }
+
+            let was_max = self.prev_win_maximized.take().unwrap_or(false);
+            if was_max {
+                // If we were maximized before entering fullscreen, just re-maximize
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            } else {
+                // Otherwise, restore saved size/position
+                if let Some(s) = self.prev_win_size { ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(s)); }
+                if let Some(p) = self.prev_win_pos  { ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p)); }
+            }
+
             self.is_borderless_fs = false;
         }
+
         ctx.request_repaint();
     }
 
@@ -302,13 +340,13 @@ impl ViewerApp {
     fn next(&mut self) {
         if self.images.is_empty() { return; }
         self.current = (self.current+1)%self.images.len();
-        self.zoom=1.;self.pan=Vec2::ZERO;self.last_cursor=None;
+        self.reset_view_like_new();
         self.prefetch.dirty = true;
     }
     fn prev(&mut self) {
         if self.images.is_empty() { return; }
         self.current = (self.current+self.images.len()-1)%self.images.len();
-        self.zoom=1.;self.pan=Vec2::ZERO;self.last_cursor=None;
+        self.reset_view_like_new();
         self.prefetch.dirty = true;
     }
 
@@ -324,9 +362,7 @@ impl ViewerApp {
 /* ─────────────────── eframe integration ───────────────────────── */
 impl App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        use egui::{Color32, ColorImage, CursorIcon, Key, Label, PointerButton, Pos2, Rect, Sense};
-
-        fn no_sel(text: impl Into<egui::WidgetText>) -> Label { Label::new(text).selectable(false) }
+        use egui::{Color32, ColorImage, CursorIcon, Key, PointerButton, Pos2, Rect, Sense};
 
         let input = ctx.input(|i| i.clone());
 
@@ -439,7 +475,7 @@ impl App for ViewerApp {
         // 5) Central panel (drag/pan via click_and_drag; double-click handled globally)
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.images.is_empty() {
-                ui.centered_and_justified(|ui| ui.add(no_sel("Loading images…")));
+                // Draw nothing until images are ready.
                 return;
             }
 
@@ -469,6 +505,8 @@ impl App for ViewerApp {
                 });
             };
 
+            let pan_allowed = !(self.suppress_drag_once || self.suppress_drag_until_release);
+
             match self.layout {
                 Layout::One => {
                     let img  = self.current_img().unwrap();
@@ -486,7 +524,12 @@ impl App for ViewerApp {
                     );
 
                     if resp.hovered() { set_grab(false); }
-                    if resp.dragged()  { self.pan += resp.drag_delta(); set_grab(true); }
+                    if resp.dragged()  {
+                        if pan_allowed {
+                            self.pan += resp.drag_delta();
+                            set_grab(true);
+                        }
+                    }
                 }
                 Layout::Two | Layout::Three => {
                     let n = if self.layout == Layout::Two { 2 } else { 3 };
@@ -508,7 +551,12 @@ impl App for ViewerApp {
                     });
 
                     if resp.hovered() { set_grab(false); }
-                    if resp.dragged()  { self.pan += resp.drag_delta(); set_grab(true); }
+                    if resp.dragged()  {
+                        if pan_allowed {
+                            self.pan += resp.drag_delta();
+                            set_grab(true);
+                        }
+                    }
                 }
             }
         });
@@ -579,6 +627,15 @@ impl App for ViewerApp {
                     }
                 });
             });
+        }
+
+        // Only suppress drag for a single frame after reset/toggle…
+        if self.suppress_drag_once {
+            self.suppress_drag_once = false;
+        }
+        // …and suppress until the user releases all pointer buttons after a toggle
+        if self.suppress_drag_until_release && !input.pointer.any_down() {
+            self.suppress_drag_until_release = false;
         }
 
         // Default cursor if we didn't set Grab/Grabbing above:
