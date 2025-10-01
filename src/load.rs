@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::OnceLock,
     time::SystemTime,
 };
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{select, Receiver, Sender};
 use eframe::egui;
 use image::{DynamicImage, ImageReader};
 
@@ -17,19 +18,19 @@ pub type JobMsg  = (u64, PathBuf);
 /// discovered path
 pub type PathMsg = PathBuf;
 
-// Suggested capacities (match previous behavior)
+// Suggested capacities
 pub const IMG_CHAN_CAP: usize   = 1024;
 pub const PATHS_CHAN_CAP: usize = 8192;
 
-// Back-pressure for decode job queue
-pub const MAX_ENQUEUED_JOBS: usize = 2048;
+// Back-pressure for decode job queue (bump to keep pipeline full with many cores)
+pub const MAX_ENQUEUED_JOBS: usize = 8192;
 
 /* ───────────────────────── prefetch tuneables ───────────────────── */
 
-/// How far around the prefetch center to walk (lightweight order).
+/// Initial (fallback) radius; will be widened to full list on recenter().
 pub const PREFETCH_RADIUS: usize = 512;
 
-/// How many items to attempt to enqueue per scheduler tick.
+/// Legacy hint from the UI; we’ll adapt beyond this in `tick()`.
 pub const PREFETCH_PER_TICK: usize = 64;
 
 /* ───────────────────────── queue state (dedupe) ─────────────────── */
@@ -72,7 +73,7 @@ impl QueueState {
 
 /* ───────────────────────── prefetch scheduler ───────────────────── */
 
-/// Minimal, GUI-agnostic prefetch state machine.
+/// Minimal, GUI-agnostic prefetch state machine (sliding window).
 #[derive(Debug, Clone)]
 pub struct Prefetcher {
     pub center_idx: usize,
@@ -109,10 +110,8 @@ impl Prefetcher {
     }
 
     /// Convenience: derive center index from either the current path or a pending target name,
-    /// falling back to the first file.
-    ///
-    /// `index_of` is a map from path -> index in `files`. If you already maintain this in the UI,
-    /// pass it through; otherwise you can build it cheaply once per refresh.
+    /// falling back to the first file. Also widen radius to cover the whole list so we’ll enqueue
+    /// EVERYTHING, expanding from the center.
     pub fn recenter(
         &mut self,
         files: &[PathBuf],
@@ -131,11 +130,29 @@ impl Prefetcher {
             Some(0)
         }.unwrap_or(0);
 
+        // Cover the whole list — smooth, complete loading outward from the center
+        self.radius = files.len().saturating_sub(1);
+
         self.recenter_to(idx);
     }
 
+    /// Adaptive per-tick budget based on CPU and queue headroom.
+    #[inline]
+    fn adaptive_budget(job_tx: &Sender<JobMsg>, max_enqueued_jobs: usize, ui_hint: usize, seen: usize) -> usize {
+        let free = max_enqueued_jobs.saturating_sub(job_tx.len());
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+        // Early phase: be more aggressive until a few hundred are enqueued/seen,
+        // then settle. Aim to keep ~16*cores queued ahead but never exceed headroom.
+        let ramp = if seen < 256 { 2 } else { 1 };
+        let target = cores.saturating_mul(16 * ramp);
+
+        // Allow bursts early; never exceed remaining channel capacity.
+        free.min(target.max(ui_hint).min(1024))
+    }
+
     /// Walk outward from `center_idx` in the sequence: 0, +1, -1, +2, -2, ...
-    /// Enqueue up to `max_to_enqueue` new decode jobs into `job_tx`, respecting `qstate`.
+    /// Enqueue new decode jobs into `job_tx`, respecting `qstate`.
     ///
     /// Returns the number of paths newly enqueued this tick.
     pub fn tick(
@@ -143,15 +160,18 @@ impl Prefetcher {
         files: &[PathBuf],
         qstate: &mut QueueState,
         job_tx: &Sender<JobMsg>,
-        max_to_enqueue: usize,
+        max_to_enqueue_hint: usize,
         max_enqueued_jobs: usize,
         gen_id: u64,
     ) -> usize {
         if !self.dirty || files.is_empty() { return 0; }
         if job_tx.len() >= max_enqueued_jobs { return 0; }
 
+        let budget = Self::adaptive_budget(job_tx, max_enqueued_jobs, max_to_enqueue_hint, qstate.seen.len());
+        if budget == 0 { return 0; }
+
         let mut emitted = 0usize;
-        while emitted < max_to_enqueue {
+        while emitted < budget {
             let step_abs = self.step.unsigned_abs();
             if step_abs > self.radius { break; }
 
@@ -174,7 +194,7 @@ impl Prefetcher {
             }
         }
 
-        if emitted == 0 || self.step.unsigned_abs() > self.radius {
+        if self.step.unsigned_abs() > self.radius {
             self.dirty = false;
         }
         emitted
@@ -183,15 +203,14 @@ impl Prefetcher {
 
 /* ───────────────────────── decoding / workers ───────────────────── */
 
-// ── keep this private; we’ll use it below so it’s not dead code anymore
+#[inline]
 fn suggested_decoder_threads() -> usize {
-    const MIN: usize = 2;
-    const MAX: usize = 12;
+    // Use ~3/4 of logical cores for decoders (avoid starving GUI + IO),
+    // clamp conservatively for big workstations.
     let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let target = (logical * 2) / 3;
-    target.clamp(MIN, MAX)
+    let target = (logical * 3) / 4;
+    target.clamp(3, 24)
 }
-
 
 #[cfg(windows)]
 fn open_file_sequential(path: &PathBuf) -> std::io::Result<std::fs::File> {
@@ -216,7 +235,7 @@ fn try_decode_with_hint(_path: &PathBuf) -> Result<DynamicImage, ()> {
 }
 
 fn decode_image(path: &PathBuf) -> Result<DynamicImage, ()> {
-    // On Windows, attempt sequential-hint; fallback to normal open.
+    // Synchronous file IO, decode on CPU (leverages SIMD in image >= 0.25).
     try_decode_with_hint(path).or_else(|_| ImageReader::open(path).map_err(|_| ())?.decode().map_err(|_| ()))
 }
 
@@ -257,8 +276,24 @@ pub fn decode_full_rgba_downscaled(path: &PathBuf, max_dim: u32) -> Result<(usiz
         (nw, nh)
     };
 
+    // Triangle is a good quality/speed tradeoff for previews.
     let resized = img.resize(nw, nh, FilterType::Triangle).to_rgba8();
     Ok((resized.width() as usize, resized.height() as usize, resized.into_raw(), bytes, created))
+}
+
+/* Global Rayon decoder pool (one-time init) */
+static DECODER_POOL_INIT: OnceLock<()> = OnceLock::new();
+
+#[inline]
+fn init_decoder_pool(threads: usize) {
+    DECODER_POOL_INIT.get_or_init(|| {
+        let effective = if threads == 0 { suggested_decoder_threads() } else { threads };
+        // Build the *global* pool once; ignore Err if already set.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(effective.max(2))
+            .thread_name(|i| format!("decoder-{}", i))
+            .build_global();
+    });
 }
 
 pub fn start_decoder_workers_pool(
@@ -271,32 +306,31 @@ pub fn start_decoder_workers_pool(
     use_downscaled: bool,
     max_dim: u32,
 ) {
-    use rayon::ThreadPoolBuilder;
     use std::sync::atomic::Ordering;
 
-    // NEW: pick a sensible default if caller passes 0
-    let effective_threads = if threads == 0 { suggested_decoder_threads() } else { threads };
+    // Ensure the global Rayon pool exists
+    init_decoder_pool(threads);
+    let effective = if threads == 0 { suggested_decoder_threads() } else { threads };
 
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(effective_threads.max(2))
-        .thread_name(|i| format!("decoder-{}", i))
-        .build()
-        .expect("build decoder pool");
-
-    let prio_rx = prio_job_rx;
-    for _ in 0..effective_threads.max(2) {
-        let rx = job_rx.clone();
-        let prx = prio_rx.clone();
-        let tx = img_tx.clone();
+    // Spawn long-lived workers onto the *global* pool
+    for _ in 0..effective.max(2) {
+        let rx  = job_rx.clone();
+        let prx = prio_job_rx.clone();
+        let tx  = img_tx.clone();
         let ctx = egui_ctx.clone();
         let gen = current_gen.clone();
 
-        pool.spawn(move || {
+        rayon::spawn(move || {
             loop {
+                // Prefer priority queue when available; otherwise fairly receive either.
                 let job = if let Some(ref pr) = prx {
-                    match pr.try_recv() {
-                        Ok(j) => Some(j),
-                        Err(_) => match rx.recv() { Ok(j) => Some(j), Err(_) => None }
+                    select! {
+                        recv(pr) -> r => r.ok(),
+                        recv(rx) -> r => r.ok(),
+                        default => {
+                            // Nothing immediately available; block on normal to avoid spin
+                            match rx.recv() { Ok(j) => Some(j), Err(_) => None }
+                        }
                     }
                 } else {
                     match rx.recv() { Ok(j) => Some(j), Err(_) => None }
@@ -304,6 +338,7 @@ pub fn start_decoder_workers_pool(
 
                 let Some((job_gen, path)) = job else { break; };
 
+                // Drop stale work (generation bumped on new loads)
                 if job_gen != gen.load(Ordering::Relaxed) { continue; }
 
                 let decoded = if use_downscaled {
@@ -313,6 +348,7 @@ pub fn start_decoder_workers_pool(
                 };
 
                 if let Ok((w, h, rgba, bytes, created)) = decoded {
+                    // Still current?
                     if job_gen != gen.load(Ordering::Relaxed) { continue; }
                     let _ = tx.send((path, w, h, rgba, bytes, created));
                     ctx.request_repaint();
@@ -322,11 +358,12 @@ pub fn start_decoder_workers_pool(
     }
 }
 
-
 /* ───────────────────────── filesystem enumeration ───────────────── */
 
 pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::Context) {
     use std::ffi::OsStr;
+    use std::thread::{sleep, yield_now};
+    use std::time::Duration;
     use jwalk::{Parallelism, WalkDir};
 
     #[inline]
@@ -337,20 +374,26 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
         }
     }
 
-    // Use a modest thread count: IO-bound; don't starve CPU decoders.
-    let threads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)).min(8);
+    // Keep walker modest to avoid stealing CPU from decoders and the GUI.
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let walker_threads = logical.saturating_div(2).clamp(1, 4);
 
-    // Walk in parallel and batch-dispatch matches to reduce contention.
-    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<PathBuf>>(threads * 2);
+    // Coalesced, rate-limited dispatch:
+    // - send in batches of 256
+    // - short sleep after each send to let GUI breathe
+    // - if the GUI path channel is near full, pause until it drains a bit
+    const BATCH: usize = 256;
+    const SLEEP_MS: u64 = 3;
+
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<PathBuf>>(walker_threads * 2);
     std::thread::spawn(move || {
-        let mut batch = Vec::with_capacity(256);
+        let mut batch = Vec::with_capacity(BATCH);
 
         WalkDir::new(dir)
             .follow_links(false)
             .sort(false)
             .skip_hidden(true)
-            // .content_first(false) // <-- not available in jwalk 0.8; remove
-            .parallelism(Parallelism::RayonNewPool(threads))
+            .parallelism(Parallelism::RayonNewPool(walker_threads))
             .into_iter()
             .for_each(|entry| {
                 if let Ok(e) = entry {
@@ -358,7 +401,7 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
                         let p: PathBuf = e.path().to_path_buf();
                         if is_img_ext(&p) {
                             batch.push(p);
-                            if batch.len() >= 256 {
+                            if batch.len() >= BATCH {
                                 let mut out = Vec::new();
                                 std::mem::swap(&mut out, &mut batch);
                                 let _ = batch_tx.send(out);
@@ -371,17 +414,28 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
         if !batch.is_empty() {
             let _ = batch_tx.send(batch);
         }
-        // drop(batch_tx) when thread exits closes the channel
+        // channel closed when thread exits
     });
 
-    // Drain batches into the GUI channel with less contention; repaint occasionally
+    // Drain batches into the GUI channel with gentle pacing
     let mut total = 0usize;
     while let Ok(mut batch) = batch_rx.recv() {
         total += batch.len();
+
+        // If GUI channel is nearly full, wait a bit to avoid stalling the UI thread
+        while paths_tx.len() > PATHS_CHAN_CAP.saturating_sub(BATCH) {
+            sleep(Duration::from_millis(SLEEP_MS));
+        }
+
         for p in batch.drain(..) {
             let _ = paths_tx.send(p);
         }
-        if total % 512 == 0 { egui_ctx.request_repaint(); }
+
+        // Brief yield to give egui a frame
+        yield_now();
+        sleep(Duration::from_millis(SLEEP_MS));
+
+        if total % 256 == 0 { egui_ctx.request_repaint(); }
     }
     egui_ctx.request_repaint();
 }
@@ -389,7 +443,7 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
 /* ───────────────────────── optional: channel factory ────────────── */
 
 /// Convenience for keeping channel creation out of the UI layer.
-#[allow(dead_code)]  // silence warning if not used by the binary
+#[allow(dead_code)]
 pub fn new_channels() -> (
     Sender<ImgMsg>,   Receiver<ImgMsg>,
     Sender<PathMsg>,  Receiver<PathMsg>,

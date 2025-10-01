@@ -8,8 +8,10 @@ use std::{env, path::PathBuf};
 use eframe::{egui::ViewportBuilder, NativeOptions};
 
 fn main() -> eframe::Result<()> {
+    // Optional CLI arg: a file or folder to open.
     let start_path = env::args().nth(1).map(PathBuf::from);
 
+    // GUI opts: start windowed with decorations. We manage borderless FS ourselves.
     let mut opts = NativeOptions::default();
     opts.viewport = ViewportBuilder::default()
         .with_inner_size([960.0, 540.0])

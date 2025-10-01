@@ -20,6 +20,12 @@ use crate::sort;
 const UPLOADS_PER_FRAME: usize = 4;
 const PATHS_PER_FRAME: usize   = 64;
 
+/* Reel animation tuneables */
+const REEL_GAP_PX: f32         = 12.0; // spacing between tiles
+const REEL_NEIGHBORS: isize    = 3;    // tiles to draw on each side
+const REEL_OMEGA: f32          = 12.0; // higher = snappier easing (images/sec response cap)
+const REEL_MAX_DT: f32         = 0.05; // clamp dt spikes for stability (kept for reference)
+
 /* ───────────────────────── domain types ─────────────────────────── */
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -70,6 +76,8 @@ pub(crate) struct FileMeta {
 pub struct ViewerApp {
     images: Vec<ImgEntry>,
     files: Vec<FileMeta>,
+    /// NEW: mirror of file paths in current sort order — avoids per-frame allocs/clones
+    file_paths: Vec<PathBuf>,
     index_of: HashMap<PathBuf, usize>,
 
     current: usize,
@@ -127,6 +135,17 @@ pub struct ViewerApp {
 
     // For ultra-fast double-click detection
     last_primary_down: Option<Instant>,
+
+    // ── debounce expensive sort+recenter while many paths arrive
+    last_sort_at: Instant,
+    pending_paths_since_sort: usize,
+
+    // ── optional animation
+    animate_reel: bool,
+    reel_pos: f32,                 // fractional index, 0..images.len()-1 (clamped)
+    reel_target: f32,              // desired index (float)
+    last_anim_tick: Instant,       // per-frame dt
+    last_prefetch_center: Option<usize>, // last index we centered prefetch on
 }
 
 impl ViewerApp {
@@ -139,6 +158,7 @@ impl ViewerApp {
         Self {
             images: Vec::new(),
             files: Vec::new(),
+            file_paths: Vec::new(),
             index_of: HashMap::new(),
             current: 0,
             img_rx, img_tx,
@@ -147,7 +167,7 @@ impl ViewerApp {
             job_tx_prio, job_rx_prio,
 
             qstate: load::QueueState::default(),
-            // use Prefetcher::new so it's not dead code
+            // Sliding-window prefetch with reasonable default radius
             prefetch: load::Prefetcher::new(64),
             current_gen: Arc::new(AtomicU64::new(1)),
 
@@ -175,11 +195,23 @@ impl ViewerApp {
 
             egui_ctx,
             last_primary_down: None,
+
+            // debounce state
+            last_sort_at: Instant::now(),
+            pending_paths_since_sort: 0,
+
+            // animation state
+            animate_reel: true,
+            reel_pos: 0.0,
+            reel_target: 0.0,
+            last_anim_tick: Instant::now(),
+            last_prefetch_center: None,
         }
     }
 
     fn launch_workers(&self, use_downscaled: bool, max_dim: u32) {
-        // Dedicated decoder pool; keep walkers separate (in load::enumerate_paths)
+        // Dedicated decoder pool; keep walkers separate (in load::enumerate_paths).
+        // Sync file IO + multi-core CPU decode (Rayon) == best bang-per-buck.
         let threads = {
             const MIN: usize = 2; const MAX: usize = 12;
             let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -319,6 +351,19 @@ impl ViewerApp {
         if self.current >= self.images.len() && !self.images.is_empty() {
             self.current = self.images.len() - 1;
         }
+
+        // Keep reel indices valid if animation is enabled
+        if self.animate_reel {
+            if !self.images.is_empty() {
+                let max_idx = (self.images.len() - 1) as f32;
+                self.reel_pos    = self.current.min(self.images.len() - 1) as f32;
+                self.reel_target = self.reel_pos.clamp(0.0, max_idx);
+            } else {
+                self.reel_pos = 0.0;
+                self.reel_target = 0.0;
+            }
+        }
+
         self.zoom = 1.; self.pan=Vec2::ZERO; self.last_cursor=None;
         self.prefetch.dirty = true;
     }
@@ -326,6 +371,7 @@ impl ViewerApp {
     fn reset_for_new_load(&mut self) {
         self.images.clear();
         self.files.clear();
+        self.file_paths.clear();
         self.index_of.clear();
         self.current = 0;
         self.qstate.clear();
@@ -335,27 +381,79 @@ impl ViewerApp {
         self.current_gen.fetch_add(1, Ordering::Relaxed);
         // also clear enqueued set to allow requeue under new ordering
         self.qstate.enqueued.clear();
+
+        // reset debounce state
+        self.last_sort_at = Instant::now();
+        self.pending_paths_since_sort = 0;
+
+        // reset animation state
+        self.reel_pos = 0.0;
+        self.reel_target = 0.0;
+        self.last_anim_tick = Instant::now();
+        self.last_prefetch_center = None;
     }
 
     fn next(&mut self) {
         if self.images.is_empty() { return; }
-        self.current = (self.current+1)%self.images.len();
-        self.reset_view_like_new();
+        if self.animate_reel {
+            let max_idx = (self.images.len() - 1) as f32;
+            self.reel_target = (self.reel_target + 1.0).clamp(0.0, max_idx);
+        } else {
+            self.current = (self.current+1)%self.images.len();
+            self.reset_view_like_new();
+        }
         self.prefetch.dirty = true;
     }
     fn prev(&mut self) {
         if self.images.is_empty() { return; }
-        self.current = (self.current+self.images.len()-1)%self.images.len();
-        self.reset_view_like_new();
+        if self.animate_reel {
+            let max_idx = (self.images.len() - 1) as f32;
+            self.reel_target = (self.reel_target - 1.0).clamp(0.0, max_idx);
+        } else {
+            self.current = (self.current+self.images.len()-1)%self.images.len();
+            self.reset_view_like_new();
+        }
         self.prefetch.dirty = true;
     }
 
     fn recenter_prefetch(&mut self) {
-        let paths: Vec<PathBuf> = self.files.iter().map(|m| m.path.clone()).collect();
         let cur_path_owned: Option<PathBuf> = self.current_img().map(|e| e.path.clone());
         let cur_path_ref: Option<&PathBuf> = cur_path_owned.as_ref();
         let pending = self.pending_target.as_deref();
-        self.prefetch.recenter(&paths, cur_path_ref, pending, &self.index_of);
+        self.prefetch.recenter(&self.file_paths, cur_path_ref, pending, &self.index_of);
+    }
+
+    #[inline]
+    fn step_reel_animation(&mut self) {
+        if !self.animate_reel || self.images.is_empty() { return; }
+
+        let max_idx = (self.images.len() - 1) as f32;
+        self.reel_target = self.reel_target.clamp(0.0, max_idx);
+
+        let now = Instant::now();
+        let dt_total = (now - self.last_anim_tick).as_secs_f32();
+        self.last_anim_tick = now;
+
+        // 240 Hz micro-stepping for ultra-smooth motion
+        let mut dt_left = dt_total.min(0.20); // safety cap in case of stalls
+        const H: f32 = 1.0 / 240.0;
+        while dt_left > 0.0 {
+            let h = dt_left.min(H);
+            let alpha = 1.0 - (-REEL_OMEGA * h).exp();
+            self.reel_pos += (self.reel_target - self.reel_pos) * alpha;
+            dt_left -= h;
+        }
+
+        self.reel_pos = self.reel_pos.clamp(0.0, max_idx);
+
+        let new_cur = self.reel_pos.round() as usize;
+        if new_cur != self.current {
+            self.current = new_cur;
+            if self.last_prefetch_center != Some(new_cur) {
+                self.last_prefetch_center = Some(new_cur);
+                self.prefetch.dirty = true; // keep decoders feeding the reel edges
+            }
+        }
     }
 }
 
@@ -390,7 +488,7 @@ impl App for ViewerApp {
         if input.modifiers.alt && !self.prev_alt_down { self.show_top_bar = !self.show_top_bar; }
         self.prev_alt_down = input.modifiers.alt;
 
-        // 1) Drain decoded images → upload textures (now includes metadata; no fs::metadata here)
+        // 1) Drain decoded images → upload textures
         let mut uploaded = 0usize;
         loop {
             match self.img_rx.try_recv() {
@@ -419,31 +517,49 @@ impl App for ViewerApp {
         }
         if uploaded > 0 { ctx.request_repaint(); }
 
-        // 2) Drain discovered paths → index & (re)sort files as needed
-        let mut got_paths = false;
+        // 2) Drain discovered paths → index; DEBOUNCE the expensive sort/recenter
+        let mut got_paths = 0usize;
         for _ in 0..PATHS_PER_FRAME {
             match self.paths_rx.try_recv() {
                 Ok(p) => {
                     let meta = lightweight_meta(&p);
                     self.index_of.insert(p.clone(), self.files.len());
                     self.files.push(meta);
-                    got_paths = true;
+                    self.file_paths.push(p); // keep mirror in-order with files[]
+                    got_paths += 1;
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
-        if got_paths {
-            sort::sort_files_lightweight(&mut self.files, self.sort_key, self.ascending, &mut self.index_of);
-            self.recenter_prefetch();
-            ctx.request_repaint();
+
+        if got_paths > 0 {
+            self.pending_paths_since_sort += got_paths;
+
+            const MIN_BATCH_BEFORE_SORT: usize = 256;
+            const MAX_SORT_INTERVAL_MS: u64 = 100;
+
+            let due_time  = self.last_sort_at.elapsed().as_millis() as u64 >= MAX_SORT_INTERVAL_MS;
+            let due_batch = self.pending_paths_since_sort >= MIN_BATCH_BEFORE_SORT;
+
+            if due_time || due_batch {
+                sort::sort_files_lightweight(&mut self.files, self.sort_key, self.ascending, &mut self.index_of);
+
+                // rebuild file_paths to match the new order (cost happens rarely, not per frame)
+                self.file_paths.clear();
+                self.file_paths.extend(self.files.iter().map(|m| m.path.clone()));
+
+                self.recenter_prefetch();
+                self.pending_paths_since_sort = 0;
+                self.last_sort_at = Instant::now();
+                ctx.request_repaint();
+            }
         }
 
-        // 3) Prefetch scheduling (pure load-layer logic)
+        // 3) Prefetch scheduling — **no per-frame clones** anymore
         {
-            let paths: Vec<PathBuf> = self.files.iter().map(|m| m.path.clone()).collect();
             let gen = self.current_gen.load(Ordering::Relaxed);
             let _enq = self.prefetch.tick(
-                &paths,
+                &self.file_paths,
                 &mut self.qstate,
                 &self.job_tx,
                 load::PREFETCH_PER_TICK,
@@ -456,15 +572,8 @@ impl App for ViewerApp {
         // 4) Hotkeys
         if input.key_pressed(Key::ArrowRight) { self.next(); }
         if input.key_pressed(Key::ArrowLeft)  { self.prev(); }
-
-        // Keyboard fullscreen toggle uses *borderless* fullscreen too
-        if input.key_pressed(Key::F11) {
-            self.toggle_borderless_fullscreen(ctx);
-        }
-        if input.key_pressed(Key::Escape) && self.is_borderless_fs {
-            self.toggle_borderless_fullscreen(ctx);
-        }
-
+        if input.key_pressed(Key::F11) { self.toggle_borderless_fullscreen(ctx); }
+        if input.key_pressed(Key::Escape) && self.is_borderless_fs { self.toggle_borderless_fullscreen(ctx); }
         if input.key_pressed(Key::Delete) { self.delete_current(); }
         match input.raw_scroll_delta.y {
             d if d > 0.0 => self.prev(),
@@ -472,12 +581,10 @@ impl App for ViewerApp {
             _ => {}
         }
 
-        // 5) Central panel (drag/pan via click_and_drag; double-click handled globally)
+        // 5) Central panel
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.images.is_empty() {
-                // Draw nothing until images are ready.
-                return;
-            }
+            use egui::{Color32, Pos2, Rect, Sense};
+            if self.images.is_empty() { return; }
 
             let full  = ui.available_rect_before_wrap();
             let bar_h = if self.show_top_bar { 32.0 } else { 0.0 };
@@ -504,64 +611,108 @@ impl App for ViewerApp {
                     o.cursor_icon = if grabbing { CursorIcon::Grabbing } else { CursorIcon::Grab };
                 });
             };
-
             let pan_allowed = !(self.suppress_drag_once || self.suppress_drag_until_release);
 
-            match self.layout {
-                Layout::One => {
-                    let img  = self.current_img().unwrap();
-                    let base = img.tex.size_vec2(); // full texture size (native)
-                    let fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
-                    let size = base * fit * self.zoom;
-                    let rect = Rect::from_center_size(avail.center()+self.pan, size);
+            // Animated reel
+            if self.layout == Layout::One && self.animate_reel {
+                self.step_reel_animation();
+
+                let cur  = &self.images[self.current];
+                let base = cur.tex.size_vec2();
+                let tile_fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
+                let tile_size = base * tile_fit * self.zoom;
+
+                let step_x = tile_size.x + REEL_GAP_PX;
+
+                let center_idx_f = self.reel_pos;
+                let base_idx     = center_idx_f.floor() as isize;
+                let frac         = center_idx_f - base_idx as f32;
+
+                for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
+                    let idx_isize = base_idx + k;
+                    if idx_isize < 0 { continue; }
+                    let idx = idx_isize as usize;
+                    if idx >= self.images.len() { continue; }
+
+                    let entry = &self.images[idx];
+
+                    let cx = avail.center().x + ((k as f32 - frac) * step_x) + self.pan.x;
+                    let cy = avail.center().y + self.pan.y;
+                    let rect = Rect::from_center_size(Pos2::new(cx, cy), tile_size);
 
                     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-
                     ui.painter().image(
-                        img.tex.id(), rect,
+                        entry.tex.id(), rect,
                         egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)),
                         Color32::WHITE,
                     );
 
                     if resp.hovered() { set_grab(false); }
-                    if resp.dragged()  {
+                    if resp.dragged() {
                         if pan_allowed {
                             self.pan += resp.drag_delta();
                             set_grab(true);
                         }
                     }
                 }
-                Layout::Two | Layout::Three => {
-                    let n = if self.layout == Layout::Two { 2 } else { 3 };
-                    let mut tiles = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let e   = &self.images[(self.current+i)%self.images.len()];
-                        let fit = (avail.width()/(n as f32)/e.tex.size_vec2().x)
-                                   .min(avail.height()/e.tex.size_vec2().y).min(1.0);
-                        tiles.push((e.tex.id(), e.tex.size_vec2()*fit*self.zoom));
+            } else {
+                // Legacy rendering
+                match self.layout {
+                    Layout::One => {
+                        let img  = self.current_img().unwrap();
+                        let base = img.tex.size_vec2();
+                        let fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
+                        let size = base * fit * self.zoom;
+                        let rect = Rect::from_center_size(avail.center()+self.pan, size);
+
+                        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+
+                        ui.painter().image(
+                            img.tex.id(), rect,
+                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)),
+                            Color32::WHITE,
+                        );
+
+                        if resp.hovered() { set_grab(false); }
+                        if resp.dragged() {
+                            if pan_allowed {
+                                self.pan += resp.drag_delta();
+                                set_grab(true);
+                            }
+                        }
                     }
-                    let w: f32 = tiles.iter().map(|(_,s)|s.x).sum();
-                    let h: f32 = tiles.iter().map(|(_,s)|s.y).fold(0.0, f32::max);
-                    let rect   = Rect::from_center_size(avail.center()+self.pan, Vec2::new(w,h));
+                    Layout::Two | Layout::Three => {
+                        let n = if self.layout == Layout::Two { 2 } else { 3 };
+                        let mut tiles = Vec::with_capacity(n);
+                        for i in 0..n {
+                            let e   = &self.images[(self.current+i)%self.images.len()];
+                            let fit = (avail.width()/(n as f32)/e.tex.size_vec2().x)
+                                       .min(avail.height()/e.tex.size_vec2().y).min(1.0);
+                            tiles.push((e.tex.id(), e.tex.size_vec2()*fit*self.zoom));
+                        }
+                        let w: f32 = tiles.iter().map(|(_,s)|s.x).sum();
+                        let h: f32 = tiles.iter().map(|(_,s)|s.y).fold(0.0, f32::max);
+                        let rect   = Rect::from_center_size(avail.center()+self.pan, Vec2::new(w,h));
 
-                    let resp   = ui.allocate_rect(rect, Sense::click_and_drag());
+                        let resp   = ui.allocate_rect(rect, Sense::click_and_drag());
 
-                    ui.allocate_ui_at_rect(rect, |ui|{
-                        ui.horizontal_centered(|ui| for (id,sz) in tiles { ui.image((id,sz)); });
-                    });
+                        ui.allocate_ui_at_rect(rect, |ui|{
+                            ui.horizontal_centered(|ui| for (id,sz) in tiles { ui.image((id,sz)); });
+                        });
 
-                    if resp.hovered() { set_grab(false); }
-                    if resp.dragged()  {
-                        if pan_allowed {
-                            self.pan += resp.drag_delta();
-                            set_grab(true);
+                        if resp.hovered() { set_grab(false); }
+                        if resp.dragged()  {
+                            if pan_allowed {
+                                self.pan += resp.drag_delta();
+                                set_grab(true);
+                            }
                         }
                     }
                 }
             }
         });
 
-        // 6) Menu + stats (both are hidden when show_top_bar is false)
+        // 6) Menu + stats (hidden when show_top_bar is false)
         if self.show_top_bar {
             egui::TopBottomPanel::top("menu").show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -573,6 +724,24 @@ impl App for ViewerApp {
                     if ui.button("Add folder…").clicked() {
                         if let Some(d) = rfd::FileDialog::new().pick_folder() { self.add_folder(d); }
                     }
+                    ui.separator();
+
+                    // Animation toggle
+                    let prev_anim = self.animate_reel;
+                    ui.checkbox(&mut self.animate_reel, "Animation");
+                    if self.animate_reel != prev_anim {
+                        if self.animate_reel {
+                            self.reel_pos    = self.current as f32;
+                            self.reel_target = self.reel_pos;
+                            self.last_anim_tick = Instant::now();
+                            self.last_prefetch_center = None;
+                            self.prefetch.dirty = true;
+                        } else {
+                            self.current = self.reel_pos.round() as usize;
+                            self.prefetch.dirty = true;
+                        }
+                    }
+
                     ui.separator();
 
                     let prev = (self.layout, self.sort_key, self.ascending);
@@ -601,11 +770,19 @@ impl App for ViewerApp {
                         sort::sort_images(&mut self.images, self.sort_key, self.ascending);
                         sort::sort_files_lightweight(&mut self.files, self.sort_key, self.ascending, &mut self.index_of);
 
+                        // keep file_paths in sync with new order
+                        self.file_paths.clear();
+                        self.file_paths.extend(self.files.iter().map(|m| m.path.clone()));
+
+                        if self.animate_reel {
+                            self.reel_pos    = self.current as f32;
+                            self.reel_target = self.reel_pos;
+                        }
                         self.zoom = 1.0; self.pan = Vec2::ZERO; self.last_cursor = None;
 
-                        // Allow prefetch to repopulate according to new order without re-decoding seen items.
                         self.qstate.enqueued.clear();
                         self.recenter_prefetch();
+                        self.prefetch.dirty = true;
                     }
 
                     ui.separator();
@@ -629,13 +806,22 @@ impl App for ViewerApp {
             });
         }
 
-        // Only suppress drag for a single frame after reset/toggle…
-        if self.suppress_drag_once {
-            self.suppress_drag_once = false;
-        }
-        // …and suppress until the user releases all pointer buttons after a toggle
+        if self.suppress_drag_once { self.suppress_drag_once = false; }
         if self.suppress_drag_until_release && !input.pointer.any_down() {
             self.suppress_drag_until_release = false;
+        }
+
+        // 7) Drive animations even when idle — bump to ~120 Hz for fluidity
+        {
+            use std::time::Duration;
+            const EPS: f32 = 0.0005;
+            let anim_running = self.animate_reel
+                && !self.images.is_empty()
+                && (self.reel_target - self.reel_pos).abs() > EPS;
+
+            if anim_running {
+                ctx.request_repaint_after(Duration::from_secs_f32(1.0 / 120.0));
+            }
         }
 
         // Default cursor if we didn't set Grab/Grabbing above:
@@ -644,6 +830,8 @@ impl App for ViewerApp {
         });
     }
 }
+
+
 
 /* ───────────────────────── helpers ──────────────────────────── */
 

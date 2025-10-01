@@ -4,13 +4,23 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Windows bits you already had (keep as-is if other parts of your app use them)
 winapi = { version = "0.3", features = ["winuser"] }
-winit  = "0.28"              # needed for WindowBuilder
-egui   = "0.26"
+winit  = "0.28"
+
+# egui/eframe should be on the same minor version
+egui   = "0.27"
 eframe = "0.27"
+
+# Image decoding (image 0.25+ uses zune-jpeg by default; we add optional turbojpeg below)
 image             = { version = "0.25", features = ["jpeg", "png"] }
-rayon             = "1.9"
+
+# Concurrency
+rayon             = "1.10"
 crossbeam-channel = "0.5"
-walkdir           = "2.5"
+
+# File dialog
 rfd               = "0.14"
-jwalk = "0.8.1"
+
+# Fast parallel directory walking (used by the code)
+jwalk             = "0.8.1"
