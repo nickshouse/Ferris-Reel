@@ -12,14 +12,14 @@ use image::{DynamicImage, ImageReader};
 /* ───────────────────────── channel types / caps ─────────────────── */
 
 /// (path, w, h, rgba, bytes, created)
-pub type ImgMsg  = (PathBuf, usize, usize, Vec<u8>, u64, Option<SystemTime>);
+pub type ImgMsg = (PathBuf, usize, usize, Vec<u8>, u64, Option<SystemTime>);
 /// (generation_id, path) — workers drop jobs whose gen_id != current
-pub type JobMsg  = (u64, PathBuf);
+pub type JobMsg = (u64, PathBuf);
 /// discovered path
 pub type PathMsg = PathBuf;
 
 // Suggested capacities
-pub const IMG_CHAN_CAP: usize   = 1024;
+pub const IMG_CHAN_CAP: usize = 1024;
 pub const PATHS_CHAN_CAP: usize = 8192;
 
 // Back-pressure for decode job queue (bump to keep pipeline full with many cores)
@@ -60,8 +60,15 @@ impl QueueState {
     /// Attempt to enqueue `path` if it's neither seen nor already enqueued.
     /// Returns true if enqueued.
     #[inline]
-    pub fn try_enqueue_unique(&mut self, job_tx: &Sender<JobMsg>, gen_id: u64, path: PathBuf) -> bool {
-        if self.seen.contains(&path) || self.enqueued.contains(&path) { return false; }
+    pub fn try_enqueue_unique(
+        &mut self,
+        job_tx: &Sender<JobMsg>,
+        gen_id: u64,
+        path: PathBuf,
+    ) -> bool {
+        if self.seen.contains(&path) || self.enqueued.contains(&path) {
+            return false;
+        }
         if job_tx.try_send((gen_id, path.clone())).is_ok() {
             self.enqueued.insert(path);
             true
@@ -84,14 +91,22 @@ pub struct Prefetcher {
 
 impl Default for Prefetcher {
     fn default() -> Self {
-        Self { center_idx: 0, step: 0, dirty: true, radius: PREFETCH_RADIUS }
+        Self {
+            center_idx: 0,
+            step: 0,
+            dirty: true,
+            radius: PREFETCH_RADIUS,
+        }
     }
 }
 
 impl Prefetcher {
     #[inline]
     pub fn new(radius: usize) -> Self {
-        Self { radius, ..Default::default() }
+        Self {
+            radius,
+            ..Default::default()
+        }
     }
 
     #[inline]
@@ -122,13 +137,16 @@ impl Prefetcher {
         let idx = if let Some(cp) = current_path {
             index_of.get(cp).copied()
         } else if let Some(name) = pending_target_name {
-            files.iter().position(|p| p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s == name)
-                .unwrap_or(false))
+            files.iter().position(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s == name)
+                    .unwrap_or(false)
+            })
         } else {
             Some(0)
-        }.unwrap_or(0);
+        }
+        .unwrap_or(0);
 
         // Cover the whole list — smooth, complete loading outward from the center
         self.radius = files.len().saturating_sub(1);
@@ -138,9 +156,16 @@ impl Prefetcher {
 
     /// Adaptive per-tick budget based on CPU and queue headroom.
     #[inline]
-    fn adaptive_budget(job_tx: &Sender<JobMsg>, max_enqueued_jobs: usize, ui_hint: usize, seen: usize) -> usize {
+    fn adaptive_budget(
+        job_tx: &Sender<JobMsg>,
+        max_enqueued_jobs: usize,
+        ui_hint: usize,
+        seen: usize,
+    ) -> usize {
         let free = max_enqueued_jobs.saturating_sub(job_tx.len());
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
 
         // Early phase: be more aggressive until a few hundred are enqueued/seen,
         // then settle. Aim to keep ~16*cores queued ahead but never exceed headroom.
@@ -164,16 +189,29 @@ impl Prefetcher {
         max_enqueued_jobs: usize,
         gen_id: u64,
     ) -> usize {
-        if !self.dirty || files.is_empty() { return 0; }
-        if job_tx.len() >= max_enqueued_jobs { return 0; }
+        if !self.dirty || files.is_empty() {
+            return 0;
+        }
+        if job_tx.len() >= max_enqueued_jobs {
+            return 0;
+        }
 
-        let budget = Self::adaptive_budget(job_tx, max_enqueued_jobs, max_to_enqueue_hint, qstate.seen.len());
-        if budget == 0 { return 0; }
+        let budget = Self::adaptive_budget(
+            job_tx,
+            max_enqueued_jobs,
+            max_to_enqueue_hint,
+            qstate.seen.len(),
+        );
+        if budget == 0 {
+            return 0;
+        }
 
         let mut emitted = 0usize;
         while emitted < budget {
             let step_abs = self.step.unsigned_abs();
-            if step_abs > self.radius { break; }
+            if step_abs > self.radius {
+                break;
+            }
 
             let idx = if self.step == 0 {
                 self.center_idx as isize
@@ -182,13 +220,23 @@ impl Prefetcher {
             };
 
             // Next step: 0 → +1 → -1 → +2 → -2 → ...
-            self.step = if self.step <= 0 { -self.step + 1 } else { -self.step };
+            self.step = if self.step <= 0 {
+                -self.step + 1
+            } else {
+                -self.step
+            };
 
-            if idx < 0 || (idx as usize) >= files.len() { continue; }
+            if idx < 0 || (idx as usize) >= files.len() {
+                continue;
+            }
             let path = &files[idx as usize];
 
-            if qstate.seen.contains(path) || qstate.enqueued.contains(path) { continue; }
-            if job_tx.len() >= max_enqueued_jobs { break; }
+            if qstate.seen.contains(path) || qstate.enqueued.contains(path) {
+                continue;
+            }
+            if job_tx.len() >= max_enqueued_jobs {
+                break;
+            }
             if qstate.try_enqueue_unique(job_tx, gen_id, path.clone()) {
                 emitted += 1;
             }
@@ -207,7 +255,9 @@ impl Prefetcher {
 fn suggested_decoder_threads() -> usize {
     // Use ~3/4 of logical cores for decoders (avoid starving GUI + IO),
     // clamp conservatively for big workstations.
-    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let target = (logical * 3) / 4;
     target.clamp(3, 24)
 }
@@ -226,7 +276,9 @@ fn try_decode_with_hint(path: &PathBuf) -> Result<DynamicImage, ()> {
     use std::io::BufReader;
     let f = open_file_sequential(path).map_err(|_| ())?;
     let fmt = image::ImageFormat::from_path(path).map_err(|_| ())?;
-    ImageReader::with_format(BufReader::new(f), fmt).decode().map_err(|_| ())
+    ImageReader::with_format(BufReader::new(f), fmt)
+        .decode()
+        .map_err(|_| ())
 }
 
 #[cfg(not(windows))]
@@ -236,11 +288,18 @@ fn try_decode_with_hint(_path: &PathBuf) -> Result<DynamicImage, ()> {
 
 fn decode_image(path: &PathBuf) -> Result<DynamicImage, ()> {
     // Synchronous file IO, decode on CPU (leverages SIMD in image >= 0.25).
-    try_decode_with_hint(path).or_else(|_| ImageReader::open(path).map_err(|_| ())?.decode().map_err(|_| ()))
+    try_decode_with_hint(path).or_else(|_| {
+        ImageReader::open(path)
+            .map_err(|_| ())?
+            .decode()
+            .map_err(|_| ())
+    })
 }
 
 /// Decode at original size into RGBA
-pub fn decode_full_rgba(path: &PathBuf) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
+pub fn decode_full_rgba(
+    path: &PathBuf,
+) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
     let img = decode_image(path)?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
@@ -251,7 +310,10 @@ pub fn decode_full_rgba(path: &PathBuf) -> Result<(usize, usize, Vec<u8>, u64, O
 }
 
 /// Decode and optionally downscale to fit within `max_dim`.
-pub fn decode_full_rgba_downscaled(path: &PathBuf, max_dim: u32) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
+pub fn decode_full_rgba_downscaled(
+    path: &PathBuf,
+    max_dim: u32,
+) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
     use image::imageops::FilterType;
 
     let img = decode_image(path)?;
@@ -278,7 +340,13 @@ pub fn decode_full_rgba_downscaled(path: &PathBuf, max_dim: u32) -> Result<(usiz
 
     // Triangle is a good quality/speed tradeoff for previews.
     let resized = img.resize(nw, nh, FilterType::Triangle).to_rgba8();
-    Ok((resized.width() as usize, resized.height() as usize, resized.into_raw(), bytes, created))
+    Ok((
+        resized.width() as usize,
+        resized.height() as usize,
+        resized.into_raw(),
+        bytes,
+        created,
+    ))
 }
 
 /* Global Rayon decoder pool (one-time init) */
@@ -287,11 +355,26 @@ static DECODER_POOL_INIT: OnceLock<()> = OnceLock::new();
 #[inline]
 fn init_decoder_pool(threads: usize) {
     DECODER_POOL_INIT.get_or_init(|| {
-        let effective = if threads == 0 { suggested_decoder_threads() } else { threads };
-        // Build the *global* pool once; ignore Err if already set.
+        let effective = if threads == 0 {
+            suggested_decoder_threads()
+        } else {
+            threads
+        };
+        // Build the *global* pool once; lower OS priority for decoder threads on Windows.
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(effective.max(2))
             .thread_name(|i| format!("decoder-{}", i))
+            .start_handler(|_| {
+                #[cfg(windows)]
+                unsafe {
+                    use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
+                    use winapi::um::winbase::THREAD_PRIORITY_BELOW_NORMAL;
+                    let _ =
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL as i32);
+                }
+                // #[cfg(unix)]
+                // unsafe { libc::nice(10); } // optional
+            })
             .build_global();
     });
 }
@@ -307,39 +390,51 @@ pub fn start_decoder_workers_pool(
     max_dim: u32,
 ) {
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     // Ensure the global Rayon pool exists
     init_decoder_pool(threads);
-    let effective = if threads == 0 { suggested_decoder_threads() } else { threads };
+    let effective = if threads == 0 {
+        suggested_decoder_threads()
+    } else {
+        threads
+    };
 
     // Spawn long-lived workers onto the *global* pool
     for _ in 0..effective.max(2) {
-        let rx  = job_rx.clone();
+        let rx = job_rx.clone();
         let prx = prio_job_rx.clone();
-        let tx  = img_tx.clone();
+        let tx = img_tx.clone();
         let ctx = egui_ctx.clone();
         let gen = current_gen.clone();
 
         rayon::spawn(move || {
             loop {
+                // Steady frame cadence ≈60 FPS so scrolling animation is smooth
+                ctx.request_repaint_after(Duration::from_millis(16));
+
                 // Prefer priority queue when available; otherwise fairly receive either.
                 let job = if let Some(ref pr) = prx {
                     select! {
                         recv(pr) -> r => r.ok(),
                         recv(rx) -> r => r.ok(),
                         default => {
-                            // Nothing immediately available; block on normal to avoid spin
                             match rx.recv() { Ok(j) => Some(j), Err(_) => None }
                         }
                     }
                 } else {
-                    match rx.recv() { Ok(j) => Some(j), Err(_) => None }
+                    match rx.recv() {
+                        Ok(j) => Some(j),
+                        Err(_) => None,
+                    }
                 };
 
-                let Some((job_gen, path)) = job else { break; };
+                let Some((job_gen, path)) = job else { break };
 
                 // Drop stale work (generation bumped on new loads)
-                if job_gen != gen.load(Ordering::Relaxed) { continue; }
+                if job_gen != gen.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 let decoded = if use_downscaled {
                     decode_full_rgba_downscaled(&path, max_dim)
@@ -348,11 +443,15 @@ pub fn start_decoder_workers_pool(
                 };
 
                 if let Ok((w, h, rgba, bytes, created)) = decoded {
-                    // Still current?
-                    if job_gen != gen.load(Ordering::Relaxed) { continue; }
+                    if job_gen != gen.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let _ = tx.send((path, w, h, rgba, bytes, created));
-                    ctx.request_repaint();
+                    // Gentle nudge for prompt rendering without spamming
+                    ctx.request_repaint_after(Duration::from_millis(8));
                 }
+
+                std::thread::yield_now();
             }
         });
     }
@@ -361,21 +460,34 @@ pub fn start_decoder_workers_pool(
 /* ───────────────────────── filesystem enumeration ───────────────── */
 
 pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::Context) {
+    use jwalk::{Parallelism, WalkDir};
     use std::ffi::OsStr;
     use std::thread::{sleep, yield_now};
     use std::time::Duration;
-    use jwalk::{Parallelism, WalkDir};
 
     #[inline]
     fn is_img_ext(path: &PathBuf) -> bool {
-        match path.extension().and_then(OsStr::to_str).map(|s| s.to_ascii_lowercase()) {
-            Some(ref e) if matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tiff" | "webp") => true,
+        match path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(|s| s.to_ascii_lowercase())
+        {
+            Some(ref e)
+                if matches!(
+                    e.as_str(),
+                    "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tiff" | "webp"
+                ) =>
+            {
+                true
+            }
             _ => false,
         }
     }
 
     // Keep walker modest to avoid stealing CPU from decoders and the GUI.
-    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let walker_threads = logical.saturating_div(2).clamp(1, 4);
 
     // Coalesced, rate-limited dispatch:
@@ -435,7 +547,9 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
         yield_now();
         sleep(Duration::from_millis(SLEEP_MS));
 
-        if total % 256 == 0 { egui_ctx.request_repaint(); }
+        if total % 256 == 0 {
+            egui_ctx.request_repaint();
+        }
     }
     egui_ctx.request_repaint();
 }
@@ -445,13 +559,16 @@ pub fn enumerate_paths(dir: PathBuf, paths_tx: Sender<PathMsg>, egui_ctx: egui::
 /// Convenience for keeping channel creation out of the UI layer.
 #[allow(dead_code)]
 pub fn new_channels() -> (
-    Sender<ImgMsg>,   Receiver<ImgMsg>,
-    Sender<PathMsg>,  Receiver<PathMsg>,
-    Sender<JobMsg>,   Receiver<JobMsg>,
+    Sender<ImgMsg>,
+    Receiver<ImgMsg>,
+    Sender<PathMsg>,
+    Receiver<PathMsg>,
+    Sender<JobMsg>,
+    Receiver<JobMsg>,
 ) {
     use crossbeam_channel::bounded;
-    let (img_tx,   img_rx)   = bounded::<ImgMsg>(IMG_CHAN_CAP);
+    let (img_tx, img_rx) = bounded::<ImgMsg>(IMG_CHAN_CAP);
     let (paths_tx, paths_rx) = bounded::<PathMsg>(PATHS_CHAN_CAP);
-    let (job_tx,   job_rx)   = bounded::<JobMsg>(MAX_ENQUEUED_JOBS);
+    let (job_tx, job_rx) = bounded::<JobMsg>(MAX_ENQUEUED_JOBS);
     (img_tx, img_rx, paths_tx, paths_rx, job_tx, job_rx)
 }

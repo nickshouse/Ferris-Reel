@@ -1,11 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gui;
-mod sort;
 mod load;
+mod sort;
 
-use std::{env, path::PathBuf};
 use eframe::{egui::ViewportBuilder, NativeOptions};
+use std::{env, path::PathBuf};
 
 fn main() -> eframe::Result<()> {
     // Optional CLI arg: a file or folder to open.
@@ -23,8 +23,11 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             let mut app = gui::ViewerApp::new(cc.egui_ctx.clone());
             if let Some(p) = &start_path {
-                if p.is_file() { app.spawn_loader_file(p.clone()); }
-                else if p.is_dir() { app.spawn_loader(p.clone()); }
+                if p.is_file() {
+                    app.spawn_loader_file(p.clone());
+                } else if p.is_dir() {
+                    app.spawn_loader(p.clone());
+                }
             }
             Box::new(app)
         }),

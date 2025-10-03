@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Windows bits you already had (keep as-is if other parts of your app use them)
-winapi = { version = "0.3", features = ["winuser"] }
+winapi = { version = "0.3", features = ["winuser", "processthreadsapi", "winbase"] }
 winit  = "0.28"
 
 # egui/eframe should be on the same minor version

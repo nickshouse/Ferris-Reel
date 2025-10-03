@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
+        atomic::{AtomicU64, Ordering},
         Arc,
-        atomic::{AtomicU64, Ordering}
     },
     time::{Instant, SystemTime},
 };
@@ -18,34 +18,64 @@ use crate::sort;
 /* ───────────────────────── UI tuneables ─────────────────────────── */
 
 const UPLOADS_PER_FRAME: usize = 4;
-const PATHS_PER_FRAME: usize   = 64;
+const PATHS_PER_FRAME: usize = 64;
 
 /* Reel animation tuneables */
-const REEL_GAP_PX: f32         = 12.0; // spacing between tiles
-const REEL_NEIGHBORS: isize    = 3;    // tiles to draw on each side
-const REEL_OMEGA: f32          = 12.0; // higher = snappier easing (images/sec response cap)
-const REEL_MAX_DT: f32         = 0.05; // clamp dt spikes for stability (kept for reference)
+const REEL_GAP_PX: f32 = 12.0; // spacing between tiles
+const REEL_NEIGHBORS: isize = 3; // tiles to draw on each side
+const REEL_OMEGA: f32 = 12.0; // higher = snappier easing (images/sec response cap)
+const REEL_SNAP_EPS: f32 = 0.2; // proximity threshold before advancing current index
 
 /* ───────────────────────── domain types ─────────────────────────── */
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SortKey { Name, Created, Size, Height, Width, Type }
+pub(crate) enum SortKey {
+    Name,
+    Created,
+    Size,
+    Height,
+    Width,
+    Type,
+}
 impl SortKey {
-    pub fn all() -> [Self; 6] { [Self::Name, Self::Created, Self::Size, Self::Height, Self::Width, Self::Type] }
+    pub fn all() -> [Self; 6] {
+        [
+            Self::Name,
+            Self::Created,
+            Self::Size,
+            Self::Height,
+            Self::Width,
+            Self::Type,
+        ]
+    }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Name => "Name", Self::Created => "Date", Self::Size => "Size",
-            Self::Height => "Height", Self::Width => "Width", Self::Type => "Type",
+            Self::Name => "Name",
+            Self::Created => "Date",
+            Self::Size => "Size",
+            Self::Height => "Height",
+            Self::Width => "Width",
+            Self::Type => "Type",
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Layout { One, Two, Three }
+enum Layout {
+    One,
+    Two,
+    Three,
+}
 impl Layout {
-    fn all() -> [Self; 3] { [Self::One, Self::Two, Self::Three] }
+    fn all() -> [Self; 3] {
+        [Self::One, Self::Two, Self::Three]
+    }
     fn label(self) -> &'static str {
-        match self { Self::One => "1 image", Self::Two => "2 images", Self::Three => "3 images" }
+        match self {
+            Self::One => "1 image",
+            Self::Two => "2 images",
+            Self::Three => "3 images",
+        }
     }
 }
 
@@ -142,17 +172,17 @@ pub struct ViewerApp {
 
     // ── optional animation
     animate_reel: bool,
-    reel_pos: f32,                 // fractional index, 0..images.len()-1 (clamped)
-    reel_target: f32,              // desired index (float)
-    last_anim_tick: Instant,       // per-frame dt
+    reel_pos: f32,           // fractional index, 0..images.len()-1 (clamped)
+    reel_target: f32,        // desired index (float)
+    last_anim_tick: Instant, // per-frame dt
     last_prefetch_center: Option<usize>, // last index we centered prefetch on
 }
 
 impl ViewerApp {
     pub fn new(egui_ctx: egui::Context) -> Self {
-        let (img_tx, img_rx)     = bounded::<ImgMsg>(load::IMG_CHAN_CAP);
+        let (img_tx, img_rx) = bounded::<ImgMsg>(load::IMG_CHAN_CAP);
         let (paths_tx, paths_rx) = bounded::<PathMsg>(load::PATHS_CHAN_CAP);
-        let (job_tx, job_rx)     = bounded::<JobMsg>(load::MAX_ENQUEUED_JOBS);
+        let (job_tx, job_rx) = bounded::<JobMsg>(load::MAX_ENQUEUED_JOBS);
         let (job_tx_prio, job_rx_prio) = bounded::<JobMsg>(256);
 
         Self {
@@ -161,10 +191,14 @@ impl ViewerApp {
             file_paths: Vec::new(),
             index_of: HashMap::new(),
             current: 0,
-            img_rx, img_tx,
-            paths_rx, paths_tx,
-            job_tx, job_rx,
-            job_tx_prio, job_rx_prio,
+            img_rx,
+            img_tx,
+            paths_rx,
+            paths_tx,
+            job_tx,
+            job_rx,
+            job_tx_prio,
+            job_rx_prio,
 
             qstate: load::QueueState::default(),
             // Sliding-window prefetch with reasonable default radius
@@ -213,8 +247,11 @@ impl ViewerApp {
         // Dedicated decoder pool; keep walkers separate (in load::enumerate_paths).
         // Sync file IO + multi-core CPU decode (Rayon) == best bang-per-buck.
         let threads = {
-            const MIN: usize = 2; const MAX: usize = 12;
-            let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            const MIN: usize = 2;
+            const MAX: usize = 12;
+            let logical = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
             ((logical * 2) / 3).clamp(MIN, MAX)
         };
         load::start_decoder_workers_pool(
@@ -234,14 +271,17 @@ impl ViewerApp {
         self.current_dir = Some(dir.clone());
         self.launch_workers(true, 2560);
         let paths_tx = self.paths_tx.clone();
-        let ctx      = self.egui_ctx.clone();
+        let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || load::enumerate_paths(dir, paths_tx, ctx));
     }
 
     pub fn spawn_loader_file(&mut self, file: PathBuf) {
         self.reset_for_new_load();
         self.launch_workers(true, 2560);
-        self.pending_target = file.file_name().and_then(|s| s.to_str()).map(|s| s.to_owned());
+        self.pending_target = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_owned());
 
         let gen = self.current_gen.load(Ordering::Relaxed);
 
@@ -252,7 +292,7 @@ impl ViewerApp {
             let _ = self.job_tx_prio.try_send((gen, file.clone()));
 
             let paths_tx = self.paths_tx.clone();
-            let ctx      = self.egui_ctx.clone();
+            let ctx = self.egui_ctx.clone();
             std::thread::spawn(move || load::enumerate_paths(parent, paths_tx, ctx));
         } else {
             self.current_dir = None;
@@ -264,7 +304,7 @@ impl ViewerApp {
     pub fn add_folder(&mut self, dir: PathBuf) {
         self.current_dir = Some(dir.clone());
         let paths_tx = self.paths_tx.clone();
-        let ctx      = self.egui_ctx.clone();
+        let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || load::enumerate_paths(dir, paths_tx, ctx));
         self.prefetch.dirty = true;
     }
@@ -280,9 +320,12 @@ impl ViewerApp {
     fn toggle_borderless_fullscreen(&mut self, ctx: &egui::Context) {
         let (cur_pos, cur_size, monitor_size, was_maximized) = ctx.input(|i| {
             let vp = &i.viewport();
-            let cur_pos  = vp
+            let cur_pos = vp
                 .outer_rect
-                .unwrap_or(egui::Rect::from_min_size(egui::pos2(0.0,0.0), i.screen_rect().size()))
+                .unwrap_or(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    i.screen_rect().size(),
+                ))
                 .min;
             let cur_size = vp.inner_rect.unwrap_or(i.screen_rect()).size();
             let mon_size = vp.monitor_size.unwrap_or(i.screen_rect().size());
@@ -301,9 +344,9 @@ impl ViewerApp {
             self.prev_chrome_visible = Some(self.show_top_bar);
             self.show_top_bar = false;
 
-            self.prev_win_pos        = Some(cur_pos);
-            self.prev_win_size       = Some(cur_size);
-            self.prev_win_maximized  = Some(was_maximized);
+            self.prev_win_pos = Some(cur_pos);
+            self.prev_win_size = Some(cur_size);
+            self.prev_win_maximized = Some(was_maximized);
 
             // If currently maximized, unmaximize first so size/position commands take effect
             if was_maximized {
@@ -330,8 +373,12 @@ impl ViewerApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             } else {
                 // Otherwise, restore saved size/position
-                if let Some(s) = self.prev_win_size { ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(s)); }
-                if let Some(p) = self.prev_win_pos  { ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p)); }
+                if let Some(s) = self.prev_win_size {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(s));
+                }
+                if let Some(p) = self.prev_win_pos {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(p));
+                }
             }
 
             self.is_borderless_fs = false;
@@ -340,10 +387,14 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    fn current_img(&self) -> Option<&ImgEntry> { self.images.get(self.current) }
+    fn current_img(&self) -> Option<&ImgEntry> {
+        self.images.get(self.current)
+    }
 
     fn delete_current(&mut self) {
-        if self.images.is_empty() { return; }
+        if self.images.is_empty() {
+            return;
+        }
         let path = self.images[self.current].path.clone();
         let _ = std::fs::remove_file(&path);
         self.images.remove(self.current);
@@ -356,7 +407,7 @@ impl ViewerApp {
         if self.animate_reel {
             if !self.images.is_empty() {
                 let max_idx = (self.images.len() - 1) as f32;
-                self.reel_pos    = self.current.min(self.images.len() - 1) as f32;
+                self.reel_pos = self.current.min(self.images.len() - 1) as f32;
                 self.reel_target = self.reel_pos.clamp(0.0, max_idx);
             } else {
                 self.reel_pos = 0.0;
@@ -364,7 +415,9 @@ impl ViewerApp {
             }
         }
 
-        self.zoom = 1.; self.pan=Vec2::ZERO; self.last_cursor=None;
+        self.zoom = 1.;
+        self.pan = Vec2::ZERO;
+        self.last_cursor = None;
         self.prefetch.dirty = true;
     }
 
@@ -394,23 +447,27 @@ impl ViewerApp {
     }
 
     fn next(&mut self) {
-        if self.images.is_empty() { return; }
+        if self.images.is_empty() {
+            return;
+        }
         if self.animate_reel {
             let max_idx = (self.images.len() - 1) as f32;
             self.reel_target = (self.reel_target + 1.0).clamp(0.0, max_idx);
         } else {
-            self.current = (self.current+1)%self.images.len();
+            self.current = (self.current + 1) % self.images.len();
             self.reset_view_like_new();
         }
         self.prefetch.dirty = true;
     }
     fn prev(&mut self) {
-        if self.images.is_empty() { return; }
+        if self.images.is_empty() {
+            return;
+        }
         if self.animate_reel {
             let max_idx = (self.images.len() - 1) as f32;
             self.reel_target = (self.reel_target - 1.0).clamp(0.0, max_idx);
         } else {
-            self.current = (self.current+self.images.len()-1)%self.images.len();
+            self.current = (self.current + self.images.len() - 1) % self.images.len();
             self.reset_view_like_new();
         }
         self.prefetch.dirty = true;
@@ -420,12 +477,15 @@ impl ViewerApp {
         let cur_path_owned: Option<PathBuf> = self.current_img().map(|e| e.path.clone());
         let cur_path_ref: Option<&PathBuf> = cur_path_owned.as_ref();
         let pending = self.pending_target.as_deref();
-        self.prefetch.recenter(&self.file_paths, cur_path_ref, pending, &self.index_of);
+        self.prefetch
+            .recenter(&self.file_paths, cur_path_ref, pending, &self.index_of);
     }
 
     #[inline]
     fn step_reel_animation(&mut self) {
-        if !self.animate_reel || self.images.is_empty() { return; }
+        if !self.animate_reel || self.images.is_empty() {
+            return;
+        }
 
         let max_idx = (self.images.len() - 1) as f32;
         self.reel_target = self.reel_target.clamp(0.0, max_idx);
@@ -446,11 +506,18 @@ impl ViewerApp {
 
         self.reel_pos = self.reel_pos.clamp(0.0, max_idx);
 
-        let new_cur = self.reel_pos.round() as usize;
-        if new_cur != self.current {
-            self.current = new_cur;
-            if self.last_prefetch_center != Some(new_cur) {
-                self.last_prefetch_center = Some(new_cur);
+        let target_idx = self.reel_target.round().clamp(0.0, max_idx) as usize;
+        let should_snap = (self.reel_target - self.reel_pos).abs() < REEL_SNAP_EPS;
+        let candidate_idx = if should_snap {
+            target_idx
+        } else {
+            self.current
+        };
+
+        if candidate_idx != self.current {
+            self.current = candidate_idx;
+            if self.last_prefetch_center != Some(candidate_idx) {
+                self.last_prefetch_center = Some(candidate_idx);
                 self.prefetch.dirty = true; // keep decoders feeding the reel edges
             }
         }
@@ -460,7 +527,7 @@ impl ViewerApp {
 /* ─────────────────── eframe integration ───────────────────────── */
 impl App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        use egui::{Color32, ColorImage, CursorIcon, Key, PointerButton, Pos2, Rect, Sense};
+        use egui::{ColorImage, CursorIcon, Key, PointerButton};
 
         let input = ctx.input(|i| i.clone());
 
@@ -470,7 +537,12 @@ impl App for ViewerApp {
             const DC_WINDOW: Duration = Duration::from_millis(300);
 
             for ev in &input.events {
-                if let egui::Event::PointerButton { button: egui::PointerButton::Primary, pressed: true, .. } = ev {
+                if let egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                } = ev
+                {
                     let now = Instant::now();
                     if let Some(t0) = self.last_primary_down {
                         if now.duration_since(t0) <= DC_WINDOW {
@@ -485,7 +557,9 @@ impl App for ViewerApp {
         }
 
         // Toggle chrome with Alt (applies to both top and bottom)
-        if input.modifiers.alt && !self.prev_alt_down { self.show_top_bar = !self.show_top_bar; }
+        if input.modifiers.alt && !self.prev_alt_down {
+            self.show_top_bar = !self.show_top_bar;
+        }
         self.prev_alt_down = input.modifiers.alt;
 
         // 1) Drain decoded images → upload textures
@@ -493,7 +567,9 @@ impl App for ViewerApp {
         loop {
             match self.img_rx.try_recv() {
                 Ok((path, w, h, rgba, bytes, created)) => {
-                    if self.qstate.seen.contains(&path) { continue; }
+                    if self.qstate.seen.contains(&path) {
+                        continue;
+                    }
 
                     let tex = ctx.load_texture(
                         path.file_name().unwrap().to_string_lossy(),
@@ -504,18 +580,26 @@ impl App for ViewerApp {
                     self.images.push(ImgEntry {
                         path: path.clone(),
                         name: tex.name().into(),
-                        ext : tex.name().rsplit('.').next().unwrap_or("").into(),
-                        tex, w: w as u32, h: h as u32, bytes, created,
+                        ext: tex.name().rsplit('.').next().unwrap_or("").into(),
+                        tex,
+                        w: w as u32,
+                        h: h as u32,
+                        bytes,
+                        created,
                     });
 
                     self.qstate.mark_seen(&path);
                     uploaded += 1;
-                    if uploaded >= UPLOADS_PER_FRAME { break; }
+                    if uploaded >= UPLOADS_PER_FRAME {
+                        break;
+                    }
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
-        if uploaded > 0 { ctx.request_repaint(); }
+        if uploaded > 0 {
+            ctx.request_repaint();
+        }
 
         // 2) Drain discovered paths → index; DEBOUNCE the expensive sort/recenter
         let mut got_paths = 0usize;
@@ -538,15 +622,21 @@ impl App for ViewerApp {
             const MIN_BATCH_BEFORE_SORT: usize = 256;
             const MAX_SORT_INTERVAL_MS: u64 = 100;
 
-            let due_time  = self.last_sort_at.elapsed().as_millis() as u64 >= MAX_SORT_INTERVAL_MS;
+            let due_time = self.last_sort_at.elapsed().as_millis() as u64 >= MAX_SORT_INTERVAL_MS;
             let due_batch = self.pending_paths_since_sort >= MIN_BATCH_BEFORE_SORT;
 
             if due_time || due_batch {
-                sort::sort_files_lightweight(&mut self.files, self.sort_key, self.ascending, &mut self.index_of);
+                sort::sort_files_lightweight(
+                    &mut self.files,
+                    self.sort_key,
+                    self.ascending,
+                    &mut self.index_of,
+                );
 
                 // rebuild file_paths to match the new order (cost happens rarely, not per frame)
                 self.file_paths.clear();
-                self.file_paths.extend(self.files.iter().map(|m| m.path.clone()));
+                self.file_paths
+                    .extend(self.files.iter().map(|m| m.path.clone()));
 
                 self.recenter_prefetch();
                 self.pending_paths_since_sort = 0;
@@ -566,15 +656,27 @@ impl App for ViewerApp {
                 load::MAX_ENQUEUED_JOBS,
                 gen,
             );
-            if _enq > 0 { ctx.request_repaint(); }
+            if _enq > 0 {
+                ctx.request_repaint();
+            }
         }
 
         // 4) Hotkeys
-        if input.key_pressed(Key::ArrowRight) { self.next(); }
-        if input.key_pressed(Key::ArrowLeft)  { self.prev(); }
-        if input.key_pressed(Key::F11) { self.toggle_borderless_fullscreen(ctx); }
-        if input.key_pressed(Key::Escape) && self.is_borderless_fs { self.toggle_borderless_fullscreen(ctx); }
-        if input.key_pressed(Key::Delete) { self.delete_current(); }
+        if input.key_pressed(Key::ArrowRight) {
+            self.next();
+        }
+        if input.key_pressed(Key::ArrowLeft) {
+            self.prev();
+        }
+        if input.key_pressed(Key::F11) {
+            self.toggle_borderless_fullscreen(ctx);
+        }
+        if input.key_pressed(Key::Escape) && self.is_borderless_fs {
+            self.toggle_borderless_fullscreen(ctx);
+        }
+        if input.key_pressed(Key::Delete) {
+            self.delete_current();
+        }
         match input.raw_scroll_delta.y {
             d if d > 0.0 => self.prev(),
             d if d < 0.0 => self.next(),
@@ -584,31 +686,41 @@ impl App for ViewerApp {
         // 5) Central panel
         egui::CentralPanel::default().show(ctx, |ui| {
             use egui::{Color32, Pos2, Rect, Sense};
-            if self.images.is_empty() { return; }
+            if self.images.is_empty() {
+                return;
+            }
 
-            let full  = ui.available_rect_before_wrap();
+            let full = ui.available_rect_before_wrap();
             let bar_h = if self.show_top_bar { 32.0 } else { 0.0 };
-            let avail = Rect::from_min_max(Pos2::new(full.min.x, full.min.y + bar_h),
-                                           Pos2::new(full.max.x, full.max.y - bar_h));
+            let avail = Rect::from_min_max(
+                Pos2::new(full.min.x, full.min.y + bar_h),
+                Pos2::new(full.max.x, full.max.y - bar_h),
+            );
 
-            if let Some(p) = input.pointer.hover_pos() { self.last_cursor = Some(p); }
+            if let Some(p) = input.pointer.hover_pos() {
+                self.last_cursor = Some(p);
+            }
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
             // Mouse-side-button zoom
             if input.pointer.button_pressed(PointerButton::Extra2) {
                 let nz = (self.zoom * 1.1).clamp(0.1, 10.0);
-                self.pan += (cursor - (avail.center()+self.pan)) * (1.0 - nz/self.zoom);
+                self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
                 self.zoom = nz;
             }
             if input.pointer.button_pressed(PointerButton::Extra1) {
                 let nz = (self.zoom / 1.1).clamp(0.1, 10.0);
-                self.pan += (cursor - (avail.center()+self.pan)) * (1.0 - nz/self.zoom);
+                self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
                 self.zoom = nz;
             }
 
             let set_grab = |grabbing: bool| {
                 ctx.output_mut(|o| {
-                    o.cursor_icon = if grabbing { CursorIcon::Grabbing } else { CursorIcon::Grab };
+                    o.cursor_icon = if grabbing {
+                        CursorIcon::Grabbing
+                    } else {
+                        CursorIcon::Grab
+                    };
                 });
             };
             let pan_allowed = !(self.suppress_drag_once || self.suppress_drag_until_release);
@@ -617,22 +729,28 @@ impl App for ViewerApp {
             if self.layout == Layout::One && self.animate_reel {
                 self.step_reel_animation();
 
-                let cur  = &self.images[self.current];
+                let cur = &self.images[self.current];
                 let base = cur.tex.size_vec2();
-                let tile_fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
+                let tile_fit = (avail.width() / base.x)
+                    .min(avail.height() / base.y)
+                    .min(1.0);
                 let tile_size = base * tile_fit * self.zoom;
 
                 let step_x = tile_size.x + REEL_GAP_PX;
 
                 let center_idx_f = self.reel_pos;
-                let base_idx     = center_idx_f.floor() as isize;
-                let frac         = center_idx_f - base_idx as f32;
+                let base_idx = center_idx_f.floor() as isize;
+                let frac = center_idx_f - base_idx as f32;
 
                 for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
                     let idx_isize = base_idx + k;
-                    if idx_isize < 0 { continue; }
+                    if idx_isize < 0 {
+                        continue;
+                    }
                     let idx = idx_isize as usize;
-                    if idx >= self.images.len() { continue; }
+                    if idx >= self.images.len() {
+                        continue;
+                    }
 
                     let entry = &self.images[idx];
 
@@ -642,12 +760,15 @@ impl App for ViewerApp {
 
                     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
                     ui.painter().image(
-                        entry.tex.id(), rect,
-                        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)),
+                        entry.tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
 
-                    if resp.hovered() { set_grab(false); }
+                    if resp.hovered() {
+                        set_grab(false);
+                    }
                     if resp.dragged() {
                         if pan_allowed {
                             self.pan += resp.drag_delta();
@@ -659,21 +780,26 @@ impl App for ViewerApp {
                 // Legacy rendering
                 match self.layout {
                     Layout::One => {
-                        let img  = self.current_img().unwrap();
+                        let img = self.current_img().unwrap();
                         let base = img.tex.size_vec2();
-                        let fit  = (avail.width()/base.x).min(avail.height()/base.y).min(1.0);
+                        let fit = (avail.width() / base.x)
+                            .min(avail.height() / base.y)
+                            .min(1.0);
                         let size = base * fit * self.zoom;
-                        let rect = Rect::from_center_size(avail.center()+self.pan, size);
+                        let rect = Rect::from_center_size(avail.center() + self.pan, size);
 
                         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
 
                         ui.painter().image(
-                            img.tex.id(), rect,
-                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)),
+                            img.tex.id(),
+                            rect,
+                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             Color32::WHITE,
                         );
 
-                        if resp.hovered() { set_grab(false); }
+                        if resp.hovered() {
+                            set_grab(false);
+                        }
                         if resp.dragged() {
                             if pan_allowed {
                                 self.pan += resp.drag_delta();
@@ -685,23 +811,31 @@ impl App for ViewerApp {
                         let n = if self.layout == Layout::Two { 2 } else { 3 };
                         let mut tiles = Vec::with_capacity(n);
                         for i in 0..n {
-                            let e   = &self.images[(self.current+i)%self.images.len()];
-                            let fit = (avail.width()/(n as f32)/e.tex.size_vec2().x)
-                                       .min(avail.height()/e.tex.size_vec2().y).min(1.0);
-                            tiles.push((e.tex.id(), e.tex.size_vec2()*fit*self.zoom));
+                            let e = &self.images[(self.current + i) % self.images.len()];
+                            let fit = (avail.width() / (n as f32) / e.tex.size_vec2().x)
+                                .min(avail.height() / e.tex.size_vec2().y)
+                                .min(1.0);
+                            tiles.push((e.tex.id(), e.tex.size_vec2() * fit * self.zoom));
                         }
-                        let w: f32 = tiles.iter().map(|(_,s)|s.x).sum();
-                        let h: f32 = tiles.iter().map(|(_,s)|s.y).fold(0.0, f32::max);
-                        let rect   = Rect::from_center_size(avail.center()+self.pan, Vec2::new(w,h));
+                        let w: f32 = tiles.iter().map(|(_, s)| s.x).sum();
+                        let h: f32 = tiles.iter().map(|(_, s)| s.y).fold(0.0, f32::max);
+                        let rect =
+                            Rect::from_center_size(avail.center() + self.pan, Vec2::new(w, h));
 
-                        let resp   = ui.allocate_rect(rect, Sense::click_and_drag());
+                        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
 
-                        ui.allocate_ui_at_rect(rect, |ui|{
-                            ui.horizontal_centered(|ui| for (id,sz) in tiles { ui.image((id,sz)); });
+                        ui.allocate_ui_at_rect(rect, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                for (id, sz) in tiles {
+                                    ui.image((id, sz));
+                                }
+                            });
                         });
 
-                        if resp.hovered() { set_grab(false); }
-                        if resp.dragged()  {
+                        if resp.hovered() {
+                            set_grab(false);
+                        }
+                        if resp.dragged() {
                             if pan_allowed {
                                 self.pan += resp.drag_delta();
                                 set_grab(true);
@@ -718,11 +852,19 @@ impl App for ViewerApp {
                 ui.horizontal(|ui| {
                     if ui.button("Open file…").clicked() {
                         if let Some(f) = rfd::FileDialog::new()
-                            .add_filter("Images",&["png","jpg","jpeg","bmp","gif","tiff","webp"])
-                            .pick_file() { self.spawn_loader_file(f); }
+                            .add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "bmp", "gif", "tiff", "webp"],
+                            )
+                            .pick_file()
+                        {
+                            self.spawn_loader_file(f);
+                        }
                     }
                     if ui.button("Add folder…").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().pick_folder() { self.add_folder(d); }
+                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                            self.add_folder(d);
+                        }
                     }
                     ui.separator();
 
@@ -731,7 +873,7 @@ impl App for ViewerApp {
                     ui.checkbox(&mut self.animate_reel, "Animation");
                     if self.animate_reel != prev_anim {
                         if self.animate_reel {
-                            self.reel_pos    = self.current as f32;
+                            self.reel_pos = self.current as f32;
                             self.reel_target = self.reel_pos;
                             self.last_anim_tick = Instant::now();
                             self.last_prefetch_center = None;
@@ -748,37 +890,49 @@ impl App for ViewerApp {
                     ui.label("View:");
                     egui::ComboBox::from_id_source("layout")
                         .selected_text(self.layout.label())
-                        .show_ui(ui, |ui| for lay in Layout::all() {
-                            ui.selectable_value(&mut self.layout, lay, lay.label());
+                        .show_ui(ui, |ui| {
+                            for lay in Layout::all() {
+                                ui.selectable_value(&mut self.layout, lay, lay.label());
+                            }
                         });
                     ui.separator();
                     ui.label("Sort by:");
                     egui::ComboBox::from_id_source("sort_key")
                         .selected_text(self.sort_key.label())
-                        .show_ui(ui, |ui| for k in SortKey::all() {
-                            ui.selectable_value(&mut self.sort_key, k, k.label());
+                        .show_ui(ui, |ui| {
+                            for k in SortKey::all() {
+                                ui.selectable_value(&mut self.sort_key, k, k.label());
+                            }
                         });
                     ui.label("Order:");
                     egui::ComboBox::from_id_source("sort_ord")
                         .selected_text(if self.ascending { "Asc" } else { "Desc" })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.ascending, true,  "Asc");
+                            ui.selectable_value(&mut self.ascending, true, "Asc");
                             ui.selectable_value(&mut self.ascending, false, "Desc");
                         });
 
                     if prev != (self.layout, self.sort_key, self.ascending) {
                         sort::sort_images(&mut self.images, self.sort_key, self.ascending);
-                        sort::sort_files_lightweight(&mut self.files, self.sort_key, self.ascending, &mut self.index_of);
+                        sort::sort_files_lightweight(
+                            &mut self.files,
+                            self.sort_key,
+                            self.ascending,
+                            &mut self.index_of,
+                        );
 
                         // keep file_paths in sync with new order
                         self.file_paths.clear();
-                        self.file_paths.extend(self.files.iter().map(|m| m.path.clone()));
+                        self.file_paths
+                            .extend(self.files.iter().map(|m| m.path.clone()));
 
                         if self.animate_reel {
-                            self.reel_pos    = self.current as f32;
+                            self.reel_pos = self.current as f32;
                             self.reel_target = self.reel_pos;
                         }
-                        self.zoom = 1.0; self.pan = Vec2::ZERO; self.last_cursor = None;
+                        self.zoom = 1.0;
+                        self.pan = Vec2::ZERO;
+                        self.last_cursor = None;
 
                         self.qstate.enqueued.clear();
                         self.recenter_prefetch();
@@ -786,27 +940,43 @@ impl App for ViewerApp {
                     }
 
                     ui.separator();
-                    if ui.add_enabled(!self.images.is_empty(), egui::Button::new("◀ Prev")).clicked() { self.prev(); }
-                    if ui.add_enabled(!self.images.is_empty(), egui::Button::new("Next ▶")).clicked() { self.next(); }
+                    if ui
+                        .add_enabled(!self.images.is_empty(), egui::Button::new("◀ Prev"))
+                        .clicked()
+                    {
+                        self.prev();
+                    }
+                    if ui
+                        .add_enabled(!self.images.is_empty(), egui::Button::new("Next ▶"))
+                        .clicked()
+                    {
+                        self.next();
+                    }
                 });
             });
 
             egui::TopBottomPanel::bottom("stats").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(dir) = &self.current_dir {
-                        ui.label(format!("Last folder: {}", dir.display())); ui.separator();
+                        ui.label(format!("Last folder: {}", dir.display()));
+                        ui.separator();
                     }
                     if let Some(img) = self.current_img() {
-                        ui.label(&img.name); ui.separator();
-                        ui.label(format!("{} / {}", self.current+1, self.images.len())); ui.separator();
-                        ui.label(format!("{}×{}", img.w, img.h)); ui.separator();
+                        ui.label(&img.name);
+                        ui.separator();
+                        ui.label(format!("{} / {}", self.current + 1, self.images.len()));
+                        ui.separator();
+                        ui.label(format!("{}×{}", img.w, img.h));
+                        ui.separator();
                         ui.label(human_bytes(img.bytes));
                     }
                 });
             });
         }
 
-        if self.suppress_drag_once { self.suppress_drag_once = false; }
+        if self.suppress_drag_once {
+            self.suppress_drag_once = false;
+        }
         if self.suppress_drag_until_release && !input.pointer.any_down() {
             self.suppress_drag_until_release = false;
         }
@@ -825,22 +995,36 @@ impl App for ViewerApp {
         }
 
         // Default cursor if we didn't set Grab/Grabbing above:
-        ctx.output_mut(|o| if !matches!(o.cursor_icon, CursorIcon::Grab|CursorIcon::Grabbing) {
-            o.cursor_icon = CursorIcon::Default;
+        ctx.output_mut(|o| {
+            if !matches!(o.cursor_icon, CursorIcon::Grab | CursorIcon::Grabbing) {
+                o.cursor_icon = CursorIcon::Default;
+            }
         });
     }
 }
-
-
 
 /* ───────────────────────── helpers ──────────────────────────── */
 
 fn lightweight_meta(path: &PathBuf) -> FileMeta {
     use std::fs;
-    let (bytes, created) = fs::metadata(path).map(|m| (m.len(), m.created().ok())).unwrap_or((0, None));
-    let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext  = path.extension().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-    FileMeta { path: path.clone(), name, ext, bytes, created }
+    let (bytes, created) = fs::metadata(path)
+        .map(|m| (m.len(), m.created().ok()))
+        .unwrap_or((0, None));
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    FileMeta {
+        path: path.clone(),
+        name,
+        ext,
+        bytes,
+        created,
+    }
 }
 
 fn human_bytes(b: u64) -> String {
@@ -848,8 +1032,13 @@ fn human_bytes(b: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
-    if f >= GB { format!("{:.1} GB", f / GB) }
-    else if f >= MB { format!("{:.1} MB", f / MB) }
-    else if f >= KB { format!("{:.1} KB", f / KB) }
-    else { format!("{b} B") }
+    if f >= GB {
+        format!("{:.1} GB", f / GB)
+    } else if f >= MB {
+        format!("{:.1} MB", f / MB)
+    } else if f >= KB {
+        format!("{:.1} KB", f / KB)
+    } else {
+        format!("{b} B")
+    }
 }
