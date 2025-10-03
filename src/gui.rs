@@ -106,6 +106,7 @@ pub(crate) struct FileMeta {
 
 pub struct ViewerApp {
     images: Vec<ImgEntry>,
+    images_dirty: bool,
     files: Vec<FileMeta>,
     /// NEW: mirror of file paths in current sort order — avoids per-frame allocs/clones
     file_paths: Vec<PathBuf>,
@@ -180,6 +181,8 @@ pub struct ViewerApp {
     last_anim_tick: Instant, // per-frame dt
     last_prefetch_center: Option<usize>, // last index we centered prefetch on
     reel_snap_hold: u8,
+    reel_scale: f32,
+    reel_scale_target: f32,
 }
 
 impl ViewerApp {
@@ -250,6 +253,7 @@ impl ViewerApp {
 
         Self {
             images: Vec::new(),
+            images_dirty: false,
             files: Vec::new(),
             file_paths: Vec::new(),
             index_of: HashMap::new(),
@@ -277,8 +281,8 @@ impl ViewerApp {
             prev_win_size: None,
             prev_win_maximized: None,
 
-            sort_key: SortKey::Name,
-            ascending: true,
+            sort_key: SortKey::Created,
+            ascending: false,
             layout: Layout::One,
 
             show_top_bar: true,
@@ -306,6 +310,8 @@ impl ViewerApp {
             last_anim_tick: Instant::now(),
             last_prefetch_center: None,
             reel_snap_hold: 0,
+            reel_scale: 1.0,
+            reel_scale_target: 1.0,
         }
     }
 
@@ -481,6 +487,8 @@ impl ViewerApp {
             }
         }
         self.reel_snap_hold = 0;
+        self.reel_scale = 1.0;
+        self.reel_scale_target = 1.0;
 
         self.zoom = 1.;
         self.pan = Vec2::ZERO;
@@ -490,6 +498,7 @@ impl ViewerApp {
 
     fn reset_for_new_load(&mut self) {
         self.images.clear();
+        self.images_dirty = false;
         self.files.clear();
         self.file_paths.clear();
         self.index_of.clear();
@@ -512,6 +521,8 @@ impl ViewerApp {
         self.last_anim_tick = Instant::now();
         self.last_prefetch_center = None;
         self.reel_snap_hold = 0;
+        self.reel_scale = 1.0;
+        self.reel_scale_target = 1.0;
     }
 
     fn next(&mut self) {
@@ -553,9 +564,88 @@ impl ViewerApp {
             .recenter(&self.file_paths, cur_path_ref, pending, &self.index_of);
     }
 
+    fn fit_for_idx(&self, idx: usize, viewport: Vec2) -> f32 {
+        if viewport.x <= 0.0 || viewport.y <= 0.0 || idx >= self.images.len() {
+            return 1.0;
+        }
+        let tex_size = self.images[idx].tex.size_vec2();
+        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+            return 1.0;
+        }
+        let fit_w = viewport.x / tex_size.x;
+        let fit_h = viewport.y / tex_size.y;
+        fit_w.min(fit_h).min(1.0)
+    }
+
+    fn scale_target_for(&self, center: f32, viewport: Vec2) -> f32 {
+        if self.images.is_empty() {
+            return 1.0;
+        }
+        let total = self.images.len();
+        let clamped_center = center.clamp(0.0, (total - 1) as f32);
+        let mut base_idx = clamped_center.floor() as usize;
+        if base_idx >= total {
+            base_idx = total - 1;
+        }
+        let frac = (clamped_center - base_idx as f32).clamp(0.0, 1.0);
+        let base_fit = self.fit_for_idx(base_idx, viewport);
+        if frac > 0.0 && base_idx + 1 < total {
+            let next_fit = self.fit_for_idx(base_idx + 1, viewport);
+            base_fit + (next_fit - base_fit) * frac
+        } else {
+            base_fit
+        }
+    }
+
+    fn resort_images_preserve_current(&mut self) {
+        if !self.images_dirty {
+            return;
+        }
+        if self.images.len() <= 1 {
+            self.images_dirty = false;
+            return;
+        }
+
+        let current_path = self.current_img().map(|img| img.path.clone());
+        sort::sort_images(&mut self.images, self.sort_key, self.ascending);
+
+        if let Some(path) = current_path {
+            if let Some(idx) = self.images.iter().position(|img| img.path == path) {
+                self.current = idx;
+            } else {
+                self.current = 0;
+            }
+        } else {
+            self.current = 0;
+        }
+
+        if self.animate_reel && !self.images.is_empty() {
+            let clamped = self.current.min(self.images.len() - 1) as f32;
+            self.reel_pos = clamped;
+            self.reel_target = clamped;
+            self.last_anim_tick = Instant::now();
+            self.reel_snap_hold = 0;
+        }
+
+        self.last_prefetch_center = None;
+        self.recenter_prefetch();
+        self.prefetch.dirty = true;
+        self.images_dirty = false;
+    }
+
     #[inline]
-    fn step_reel_animation(&mut self) {
-        if !self.animate_reel || self.images.is_empty() {
+    fn step_reel_animation(&mut self, viewport: Vec2) {
+        if self.images.is_empty() {
+            return;
+        }
+
+        if !self.animate_reel {
+            let clamped = self.current.min(self.images.len() - 1) as f32;
+            self.reel_pos = clamped;
+            self.reel_target = clamped;
+            let target = self.scale_target_for(clamped, viewport);
+            self.reel_scale = target;
+            self.reel_scale_target = target;
             return;
         }
 
@@ -577,6 +667,19 @@ impl ViewerApp {
         }
 
         self.reel_pos = self.reel_pos.clamp(0.0, max_idx);
+
+        let target_scale = self.scale_target_for(self.reel_pos, viewport);
+        self.reel_scale_target = target_scale;
+
+        let mut dt_left_scale = dt_total.min(0.20);
+        while dt_left_scale > 0.0 {
+            let h = dt_left_scale.min(H);
+            let alpha = 1.0 - (-REEL_OMEGA * h).exp();
+            self.reel_scale += (self.reel_scale_target - self.reel_scale) * alpha;
+            dt_left_scale -= h;
+        }
+
+        self.reel_scale = self.reel_scale.clamp(0.01, 1.0);
 
         let target_idx = self.reel_target.round().clamp(0.0, max_idx) as usize;
         let mut should_snap = (self.reel_target - self.reel_pos).abs() < REEL_SNAP_EPS;
@@ -687,11 +790,15 @@ impl App for ViewerApp {
                 bytes,
                 created,
             });
+            self.images_dirty = true;
 
             self.qstate.mark_seen(&path);
             uploaded += 1;
         }
         if uploaded > 0 {
+            if self.images_dirty {
+                self.resort_images_preserve_current();
+            }
             ctx.request_repaint();
         }
 
@@ -713,30 +820,21 @@ impl App for ViewerApp {
         if got_paths > 0 {
             self.pending_paths_since_sort += got_paths;
 
-            const MIN_BATCH_BEFORE_SORT: usize = 256;
-            const MAX_SORT_INTERVAL_MS: u64 = 100;
+            sort::sort_files_lightweight(
+                &mut self.files,
+                self.sort_key,
+                self.ascending,
+                &mut self.index_of,
+            );
 
-            let due_time = self.last_sort_at.elapsed().as_millis() as u64 >= MAX_SORT_INTERVAL_MS;
-            let due_batch = self.pending_paths_since_sort >= MIN_BATCH_BEFORE_SORT;
+            self.file_paths.clear();
+            self.file_paths
+                .extend(self.files.iter().map(|m| m.path.clone()));
 
-            if due_time || due_batch {
-                sort::sort_files_lightweight(
-                    &mut self.files,
-                    self.sort_key,
-                    self.ascending,
-                    &mut self.index_of,
-                );
-
-                // rebuild file_paths to match the new order (cost happens rarely, not per frame)
-                self.file_paths.clear();
-                self.file_paths
-                    .extend(self.files.iter().map(|m| m.path.clone()));
-
-                self.recenter_prefetch();
-                self.pending_paths_since_sort = 0;
-                self.last_sort_at = Instant::now();
-                ctx.request_repaint();
-            }
+            self.recenter_prefetch();
+            self.pending_paths_since_sort = 0;
+            self.last_sort_at = Instant::now();
+            ctx.request_repaint();
         }
 
         // 3) Prefetch scheduling — **no per-frame clones** anymore
@@ -790,6 +888,7 @@ impl App for ViewerApp {
                 Pos2::new(full.min.x, full.min.y + bar_h),
                 Pos2::new(full.max.x, full.max.y - bar_h),
             );
+            let viewport = avail.size();
 
             if let Some(p) = input.pointer.hover_pos() {
                 self.last_cursor = Some(p);
@@ -821,15 +920,9 @@ impl App for ViewerApp {
 
             // Animated reel
             if self.layout == Layout::One && self.animate_reel {
-                self.step_reel_animation();
+                self.step_reel_animation(viewport);
 
-                let cur = &self.images[self.current];
-                let base = cur.tex.size_vec2();
-                let scale = (avail.width() / base.x)
-                    .min(avail.height() / base.y)
-                    .min(1.0)
-                    * self.zoom;
-
+                let scale = self.reel_scale.max(0.01) * self.zoom;
                 let total = self.images.len();
                 let center_idx_f = self.reel_pos.clamp(0.0, (total - 1) as f32);
                 let mut base_idx = center_idx_f.floor() as isize;
@@ -912,6 +1005,9 @@ impl App for ViewerApp {
                 }
             } else {
                 // Legacy rendering
+                if self.layout == Layout::One {
+                    self.step_reel_animation(viewport);
+                }
                 match self.layout {
                     Layout::One => {
                         let img = self.current_img().unwrap();
