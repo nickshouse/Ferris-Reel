@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -19,6 +19,7 @@ use crate::sort;
 
 const UPLOADS_PER_FRAME: usize = 4;
 const PATHS_PER_FRAME: usize = 64;
+const IMG_BATCH_CAPACITY: usize = UPLOADS_PER_FRAME * 4;
 
 /* Reel animation tuneables */
 const REEL_GAP_PX: f32 = 12.0; // spacing between tiles
@@ -112,8 +113,10 @@ pub struct ViewerApp {
 
     current: usize,
 
-    img_rx: Receiver<ImgMsg>,
     img_tx: Sender<ImgMsg>,
+    img_batch_rx: Receiver<VecDeque<ImgMsg>>,
+    img_batch_pool_tx: Sender<VecDeque<ImgMsg>>,
+    pending_img_batch: Option<VecDeque<ImgMsg>>,
 
     paths_rx: Receiver<PathMsg>,
     paths_tx: Sender<PathMsg>,
@@ -176,6 +179,7 @@ pub struct ViewerApp {
     reel_target: f32,        // desired index (float)
     last_anim_tick: Instant, // per-frame dt
     last_prefetch_center: Option<usize>, // last index we centered prefetch on
+    reel_snap_hold: u8,
 }
 
 impl ViewerApp {
@@ -184,6 +188,65 @@ impl ViewerApp {
         let (paths_tx, paths_rx) = bounded::<PathMsg>(load::PATHS_CHAN_CAP);
         let (job_tx, job_rx) = bounded::<JobMsg>(load::MAX_ENQUEUED_JOBS);
         let (job_tx_prio, job_rx_prio) = bounded::<JobMsg>(256);
+        let (img_batch_tx, img_batch_rx) = bounded::<VecDeque<ImgMsg>>(2);
+        let (img_batch_pool_tx, img_batch_pool_rx) = bounded::<VecDeque<ImgMsg>>(2);
+        for _ in 0..2 {
+            let _ = img_batch_pool_tx.send(VecDeque::with_capacity(IMG_BATCH_CAPACITY));
+        }
+
+        {
+            let upstream = img_rx.clone();
+            let batch_tx = img_batch_tx.clone();
+            let pool_rx = img_batch_pool_rx;
+            let pool_tx = img_batch_pool_tx.clone();
+            std::thread::spawn(move || {
+                use crossbeam_channel::RecvTimeoutError;
+                use std::time::Duration;
+
+                let mut upstream_closed = false;
+                while let Ok(mut buf) = pool_rx.recv() {
+                    buf.clear();
+
+                    loop {
+                        if upstream_closed {
+                            break;
+                        }
+
+                        match upstream.recv_timeout(Duration::from_millis(3)) {
+                            Ok(msg) => {
+                                buf.push_back(msg);
+                                if buf.len() >= IMG_BATCH_CAPACITY {
+                                    break;
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                if !buf.is_empty() {
+                                    break;
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                upstream_closed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if buf.is_empty() {
+                        if pool_tx.send(buf).is_err() {
+                            break;
+                        }
+                        if upstream_closed {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if batch_tx.send(buf).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
 
         Self {
             images: Vec::new(),
@@ -191,8 +254,10 @@ impl ViewerApp {
             file_paths: Vec::new(),
             index_of: HashMap::new(),
             current: 0,
-            img_rx,
             img_tx,
+            img_batch_rx,
+            img_batch_pool_tx,
+            pending_img_batch: None,
             paths_rx,
             paths_tx,
             job_tx,
@@ -240,6 +305,7 @@ impl ViewerApp {
             reel_target: 0.0,
             last_anim_tick: Instant::now(),
             last_prefetch_center: None,
+            reel_snap_hold: 0,
         }
     }
 
@@ -414,6 +480,7 @@ impl ViewerApp {
                 self.reel_target = 0.0;
             }
         }
+        self.reel_snap_hold = 0;
 
         self.zoom = 1.;
         self.pan = Vec2::ZERO;
@@ -444,6 +511,7 @@ impl ViewerApp {
         self.reel_target = 0.0;
         self.last_anim_tick = Instant::now();
         self.last_prefetch_center = None;
+        self.reel_snap_hold = 0;
     }
 
     fn next(&mut self) {
@@ -453,6 +521,8 @@ impl ViewerApp {
         if self.animate_reel {
             let max_idx = (self.images.len() - 1) as f32;
             self.reel_target = (self.reel_target + 1.0).clamp(0.0, max_idx);
+            self.last_anim_tick = Instant::now();
+            self.reel_snap_hold = 2;
         } else {
             self.current = (self.current + 1) % self.images.len();
             self.reset_view_like_new();
@@ -466,6 +536,8 @@ impl ViewerApp {
         if self.animate_reel {
             let max_idx = (self.images.len() - 1) as f32;
             self.reel_target = (self.reel_target - 1.0).clamp(0.0, max_idx);
+            self.last_anim_tick = Instant::now();
+            self.reel_snap_hold = 2;
         } else {
             self.current = (self.current + self.images.len() - 1) % self.images.len();
             self.reset_view_like_new();
@@ -507,7 +579,11 @@ impl ViewerApp {
         self.reel_pos = self.reel_pos.clamp(0.0, max_idx);
 
         let target_idx = self.reel_target.round().clamp(0.0, max_idx) as usize;
-        let should_snap = (self.reel_target - self.reel_pos).abs() < REEL_SNAP_EPS;
+        let mut should_snap = (self.reel_target - self.reel_pos).abs() < REEL_SNAP_EPS;
+        if should_snap && self.reel_snap_hold > 0 {
+            self.reel_snap_hold -= 1;
+            should_snap = false;
+        }
         let candidate_idx = if should_snap {
             target_idx
         } else {
@@ -516,6 +592,9 @@ impl ViewerApp {
 
         if candidate_idx != self.current {
             self.current = candidate_idx;
+            if should_snap {
+                self.reel_snap_hold = 0;
+            }
             if self.last_prefetch_center != Some(candidate_idx) {
                 self.last_prefetch_center = Some(candidate_idx);
                 self.prefetch.dirty = true; // keep decoders feeding the reel edges
@@ -564,38 +643,53 @@ impl App for ViewerApp {
 
         // 1) Drain decoded images → upload textures
         let mut uploaded = 0usize;
-        loop {
-            match self.img_rx.try_recv() {
-                Ok((path, w, h, rgba, bytes, created)) => {
-                    if self.qstate.seen.contains(&path) {
+        while uploaded < UPLOADS_PER_FRAME {
+            let next_msg = match self.pending_img_batch.as_mut() {
+                Some(batch) => match batch.pop_front() {
+                    Some(msg) => Some(msg),
+                    None => {
+                        if let Some(empty) = self.pending_img_batch.take() {
+                            let _ = self.img_batch_pool_tx.send(empty);
+                        }
+                        None
+                    }
+                },
+                None => match self.img_batch_rx.try_recv() {
+                    Ok(batch) => {
+                        self.pending_img_batch = Some(batch);
                         continue;
                     }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                },
+            };
 
-                    let tex = ctx.load_texture(
-                        path.file_name().unwrap().to_string_lossy(),
-                        ColorImage::from_rgba_unmultiplied([w, h], &rgba),
-                        egui::TextureOptions::default(),
-                    );
+            let Some((path, w, h, rgba, bytes, created)) = next_msg else {
+                continue;
+            };
 
-                    self.images.push(ImgEntry {
-                        path: path.clone(),
-                        name: tex.name().into(),
-                        ext: tex.name().rsplit('.').next().unwrap_or("").into(),
-                        tex,
-                        w: w as u32,
-                        h: h as u32,
-                        bytes,
-                        created,
-                    });
-
-                    self.qstate.mark_seen(&path);
-                    uploaded += 1;
-                    if uploaded >= UPLOADS_PER_FRAME {
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            if self.qstate.seen.contains(&path) {
+                continue;
             }
+
+            let tex = ctx.load_texture(
+                path.file_name().unwrap().to_string_lossy(),
+                ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+                egui::TextureOptions::default(),
+            );
+
+            self.images.push(ImgEntry {
+                path: path.clone(),
+                name: tex.name().into(),
+                ext: tex.name().rsplit('.').next().unwrap_or("").into(),
+                tex,
+                w: w as u32,
+                h: h as u32,
+                bytes,
+                created,
+            });
+
+            self.qstate.mark_seen(&path);
+            uploaded += 1;
         }
         if uploaded > 0 {
             ctx.request_repaint();
@@ -731,36 +825,76 @@ impl App for ViewerApp {
 
                 let cur = &self.images[self.current];
                 let base = cur.tex.size_vec2();
-                let tile_fit = (avail.width() / base.x)
+                let scale = (avail.width() / base.x)
                     .min(avail.height() / base.y)
-                    .min(1.0);
-                let tile_size = base * tile_fit * self.zoom;
+                    .min(1.0)
+                    * self.zoom;
 
-                let step_x = tile_size.x + REEL_GAP_PX;
+                let total = self.images.len();
+                let center_idx_f = self.reel_pos.clamp(0.0, (total - 1) as f32);
+                let mut base_idx = center_idx_f.floor() as isize;
+                base_idx = base_idx.clamp(0, total as isize - 1);
+                let base_idx = base_idx as usize;
+                let frac = (center_idx_f - base_idx as f32).clamp(0.0, 1.0);
 
-                let center_idx_f = self.reel_pos;
-                let base_idx = center_idx_f.floor() as isize;
-                let frac = center_idx_f - base_idx as f32;
+                let mut neighbor_indices = Vec::new();
+                for k in -REEL_NEIGHBORS..=REEL_NEIGHBORS {
+                    let idx_isize = base_idx as isize + k;
+                    if idx_isize >= 0 && (idx_isize as usize) < total {
+                        neighbor_indices.push(idx_isize as usize);
+                    }
+                }
+
+                let mut tile_cache: HashMap<usize, (Vec2, egui::TextureId)> = HashMap::new();
+                for idx in &neighbor_indices {
+                    let entry = &self.images[*idx];
+                    tile_cache.insert(*idx, (entry.tex.size_vec2() * scale, entry.tex.id()));
+                }
+
+                let step_between = |a: usize, b: usize| -> f32 {
+                    let &(size_a, _) = tile_cache.get(&a).expect("tile cache missing index");
+                    let &(size_b, _) = tile_cache.get(&b).expect("tile cache missing index");
+                    0.5 * (size_a.x + size_b.x) + REEL_GAP_PX
+                };
+
+                let mut base_center_x = avail.center().x + self.pan.x;
+                if frac > 0.0 && base_idx + 1 < total {
+                    base_center_x -= frac * step_between(base_idx, base_idx + 1);
+                }
 
                 for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
-                    let idx_isize = base_idx + k;
-                    if idx_isize < 0 {
+                    let idx_isize = base_idx as isize + k;
+                    if idx_isize < 0 || (idx_isize as usize) >= total {
                         continue;
                     }
                     let idx = idx_isize as usize;
-                    if idx >= self.images.len() {
-                        continue;
+
+                    let &(size, tex_id) = match tile_cache.get(&idx) {
+                        Some(entry) => entry,
+                        None => continue,
+                    };
+
+                    let mut cx = base_center_x;
+                    if idx < base_idx {
+                        let mut j = idx;
+                        while j < base_idx {
+                            cx -= step_between(j, j + 1);
+                            j += 1;
+                        }
+                    } else if idx > base_idx {
+                        let mut j = base_idx;
+                        while j < idx {
+                            cx += step_between(j, j + 1);
+                            j += 1;
+                        }
                     }
 
-                    let entry = &self.images[idx];
-
-                    let cx = avail.center().x + ((k as f32 - frac) * step_x) + self.pan.x;
                     let cy = avail.center().y + self.pan.y;
-                    let rect = Rect::from_center_size(Pos2::new(cx, cy), tile_size);
+                    let rect = Rect::from_center_size(Pos2::new(cx, cy), size);
 
                     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
                     ui.painter().image(
-                        entry.tex.id(),
+                        tex_id,
                         rect,
                         egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
@@ -878,9 +1012,11 @@ impl App for ViewerApp {
                             self.last_anim_tick = Instant::now();
                             self.last_prefetch_center = None;
                             self.prefetch.dirty = true;
+                            self.reel_snap_hold = 0;
                         } else {
                             self.current = self.reel_pos.round() as usize;
                             self.prefetch.dirty = true;
+                            self.reel_snap_hold = 0;
                         }
                     }
 
@@ -929,6 +1065,7 @@ impl App for ViewerApp {
                         if self.animate_reel {
                             self.reel_pos = self.current as f32;
                             self.reel_target = self.reel_pos;
+                            self.reel_snap_hold = 0;
                         }
                         self.zoom = 1.0;
                         self.pan = Vec2::ZERO;
@@ -941,13 +1078,13 @@ impl App for ViewerApp {
 
                     ui.separator();
                     if ui
-                        .add_enabled(!self.images.is_empty(), egui::Button::new("◀ Prev"))
+                        .add_enabled(!self.images.is_empty(), egui::Button::new("< Prev"))
                         .clicked()
                     {
                         self.prev();
                     }
                     if ui
-                        .add_enabled(!self.images.is_empty(), egui::Button::new("Next ▶"))
+                        .add_enabled(!self.images.is_empty(), egui::Button::new("Next >"))
                         .clicked()
                     {
                         self.next();
