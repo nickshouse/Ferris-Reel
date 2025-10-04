@@ -860,8 +860,8 @@ impl App for ViewerApp {
 
                     // Reel toggle
                     ui.separator();
-                    ui.checkbox(&mut self.reel_enabled, "Reel");
-                    if self.reel_enabled {
+                    let reel_toggle = ui.checkbox(&mut self.reel_enabled, "Reel");
+                    if reel_toggle.changed() && self.reel_enabled {
                         // entering reel: sync state
                         self.reel_pos = self.current as f32;
                         self.reel_target = self.reel_pos;
