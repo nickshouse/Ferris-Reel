@@ -214,6 +214,8 @@ pub struct ViewerApp {
     last_prefetch_center: Option<usize>,
     reel_snap_hold: u8,     // small debounce frames after keyboard jumps
     reel_scroll_accum: f32, // accumulated scroll fractions
+    reel_auto_speed: f32,   // images-per-second auto scroll rate
+    reel_auto_phase: f32,   // running phase for auto scroll wrapping
 }
 
 impl ViewerApp {
@@ -344,6 +346,8 @@ impl ViewerApp {
             last_prefetch_center: None,
             reel_snap_hold: 0,
             reel_scroll_accum: 0.0,
+            reel_auto_speed: 0.0,
+            reel_auto_phase: 0.0,
         }
     }
 
@@ -594,6 +598,7 @@ impl ViewerApp {
         self.last_prefetch_center = None;
         self.reel_snap_hold = 0;
         self.reel_scroll_accum = 0.0;
+        self.reel_auto_phase = self.reel_target;
     }
 
     fn next(&mut self) {
@@ -777,16 +782,47 @@ impl ViewerApp {
         let total = self.images.len();
         let visible = self.visible_per_page().min(total).max(1);
         let max_start = self.reel_max_start() as f32;
-        self.reel_target = self.reel_target.clamp(0.0, max_start);
+        let span = (max_start + 1.0).max(1.0);
 
-        // exponential smoothing toward target (critical damping feel)
         let now = Instant::now();
         let dt = (now - self.last_anim_tick).as_secs_f32().min(0.25);
         self.last_anim_tick = now;
 
-        let alpha = 1.0 - (-REEL_OMEGA * dt).exp();
-        self.reel_pos += (self.reel_target - self.reel_pos) * alpha;
-        self.reel_pos = self.reel_pos.clamp(0.0, max_start);
+        let auto_speed = if self.reel_auto_speed.is_finite() {
+            self.reel_auto_speed.max(0.0)
+        } else {
+            0.0
+        };
+
+        let auto_active = max_start > 0.0 && auto_speed > 0.0001;
+
+        if auto_active {
+            // Keep phase in sync with any manual adjustments before we drift.
+            if !self.reel_auto_phase.is_finite() {
+                self.reel_auto_phase = 0.0;
+            }
+            self.reel_auto_phase = self.reel_target.clamp(0.0, max_start);
+
+            self.reel_auto_phase = (self.reel_auto_phase + auto_speed * dt).rem_euclid(span);
+
+            let frame_target = if self.reel_auto_phase > max_start {
+                self.reel_auto_phase - max_start
+            } else {
+                self.reel_auto_phase
+            };
+
+            self.reel_target = frame_target;
+            self.reel_pos = frame_target;
+        } else {
+            self.reel_target = self.reel_target.clamp(0.0, max_start);
+
+            let alpha = 1.0 - (-REEL_OMEGA * dt).exp();
+            self.reel_pos += (self.reel_target - self.reel_pos) * alpha;
+            self.reel_pos = self.reel_pos.clamp(0.0, max_start);
+
+            // Keep phase aligned for the next time auto-scroll is enabled.
+            self.reel_auto_phase = self.reel_target;
+        }
 
         // snap + current index + prefetch
         let target_idx = self.reel_target.round().clamp(0.0, max_start) as usize;
@@ -814,7 +850,7 @@ impl ViewerApp {
 
         // keep frames ticking exactly at vsync while moving
         const EPS: f32 = 0.0005;
-        if (self.reel_target - self.reel_pos).abs() > EPS {
+        if auto_active || (self.reel_target - self.reel_pos).abs() > EPS {
             ctx.request_repaint(); // vsync paced
         }
     }
@@ -873,9 +909,11 @@ impl App for ViewerApp {
         self.prev_alt_down = input.modifiers.alt;
 
         /* Is reel moving or crossfade active? Throttle heavy work while in motion. */
+        let auto_reel_active =
+            self.reel_auto_speed > 0.0001 && self.reel_max_start() > 0;
         let reel_active = self.reel_enabled
             && !self.images.is_empty()
-            && (self.reel_target - self.reel_pos).abs() > 0.0005;
+            && (((self.reel_target - self.reel_pos).abs() > 0.0005) || auto_reel_active);
         let xfade_active = self
             .transition
             .as_ref()
@@ -1131,6 +1169,10 @@ impl App for ViewerApp {
                                 }
                                 self.transition = None;
                             }
+                            ui.separator();
+                            let auto_slider = egui::Slider::new(&mut self.reel_auto_speed, 0.0..=5.0)
+                                .text("Auto scroll");
+                            ui.add_enabled(self.reel_enabled, auto_slider);
 
                             if prev != (self.layout, self.sort_key, self.ascending) {
                                 sort::sort_images(&mut self.images, self.sort_key, self.ascending);
