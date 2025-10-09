@@ -29,6 +29,8 @@ const REEL_GAP_PX: f32 = 12.0; // gap between tiles
 const REEL_NEIGHBORS: isize = 3; // tiles to draw on each side
 const REEL_OMEGA: f32 = 14.0; // responsiveness (larger = snappier)
 const REEL_SNAP_EPS: f32 = 0.15; // when |target - pos| < eps, snap current
+const REEL_SCROLL_SENS: f32 = 0.08; // how many indices per scroll-point
+const REEL_SCROLL_CLAMP: f32 = 3.0; // cap per-frame scroll adjustment
 
 /* ───────────────────────── domain types ─────────────────────────── */
 
@@ -880,10 +882,34 @@ impl App for ViewerApp {
         if input.key_pressed(Key::Delete) {
             self.delete_current();
         }
-        match input.raw_scroll_delta.y {
-            d if d > 0.0 => self.prev(),
-            d if d < 0.0 => self.next(),
-            _ => {}
+        let mut handled_scroll = false;
+        if self.reel_enabled && self.layout == Layout::One && self.images.len() > 1 {
+            let smooth_scroll = if input.smooth_scroll_delta.y != 0.0 {
+                input.smooth_scroll_delta.y
+            } else {
+                input.raw_scroll_delta.y
+            };
+            if smooth_scroll != 0.0 {
+                let mut delta = smooth_scroll * REEL_SCROLL_SENS;
+                if delta > REEL_SCROLL_CLAMP {
+                    delta = REEL_SCROLL_CLAMP;
+                } else if delta < -REEL_SCROLL_CLAMP {
+                    delta = -REEL_SCROLL_CLAMP;
+                }
+                if delta != 0.0 {
+                    let max_idx = (self.images.len() - 1) as f32;
+                    self.reel_target = (self.reel_target - delta).clamp(0.0, max_idx);
+                    ctx.request_repaint();
+                    handled_scroll = true;
+                }
+            }
+        }
+        if !handled_scroll {
+            match input.raw_scroll_delta.y {
+                d if d > 0.0 => self.prev(),
+                d if d < 0.0 => self.next(),
+                _ => {}
+            }
         }
 
         /* 5) PANELS FIRST: draw top/bottom now so CentralPanel gets the remaining space */
