@@ -584,8 +584,8 @@ impl ViewerApp {
             self.reel_scroll_accum = 0.0;
         } else {
             let visible = self.visible_per_page().min(self.images.len()).max(1);
+            let from = self.current;
             if visible == 1 {
-                let from = self.current;
                 let to = (self.current + 1) % self.images.len();
                 self.current = to;
                 if XFADE_SECS > 0.0 {
@@ -599,7 +599,6 @@ impl ViewerApp {
                     self.transition = None;
                 }
             } else {
-                let from = self.current;
                 if visible >= self.images.len() {
                     self.current = 0;
                 } else {
@@ -620,6 +619,9 @@ impl ViewerApp {
                     self.transition = None;
                 }
             }
+            if self.current != from {
+                self.reset_view_like_new();
+            }
         }
         self.prefetch.dirty = true;
     }
@@ -639,8 +641,8 @@ impl ViewerApp {
             self.reel_scroll_accum = 0.0;
         } else {
             let visible = self.visible_per_page().min(self.images.len()).max(1);
+            let from = self.current;
             if visible == 1 {
-                let from = self.current;
                 let to = (self.current + self.images.len() - 1) % self.images.len();
                 self.current = to;
                 if XFADE_SECS > 0.0 {
@@ -654,7 +656,6 @@ impl ViewerApp {
                     self.transition = None;
                 }
             } else {
-                let from = self.current;
                 if visible >= self.images.len() {
                     self.current = 0;
                 } else if self.current == 0 {
@@ -677,6 +678,9 @@ impl ViewerApp {
                 } else {
                     self.transition = None;
                 }
+            }
+            if self.current != from {
+                self.reset_view_like_new();
             }
         }
         self.prefetch.dirty = true;
@@ -1188,7 +1192,7 @@ impl App for ViewerApp {
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
             // Mouse-side-button zoom
-            if !self.reel_enabled && visible_now == 1 {
+            if !self.reel_enabled {
                 if input.pointer.button_pressed(PointerButton::Extra2) {
                     let nz = (self.zoom * 1.1).clamp(0.1, 10.0);
                     self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
@@ -1439,10 +1443,10 @@ impl App for ViewerApp {
                 }
                 let tile_step = tile_width + if visible_now > 1 { gap } else { 0.0 };
                 let total_span = tile_width * visible_now as f32 + gap * gap_count;
-                let base_left = avail.center().x - 0.5 * total_span;
-                let center_y = avail.center().y;
+                let base_left = avail.center().x + self.pan.x - 0.5 * total_span;
+                let center_y = avail.center().y + self.pan.y;
 
-                let mut draw_page = |start_idx: usize, tint: Color32| {
+                let draw_static_page = |start_idx: usize, tint: Color32| {
                     if tint.a() == 0 {
                         return;
                     }
@@ -1462,8 +1466,6 @@ impl App for ViewerApp {
                         let size = tex_size * fit * self.zoom;
                         let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
                         let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
-
-                        ui.allocate_rect(rect, Sense::hover());
                         painter.image(
                             entry.tex.id(),
                             rect,
@@ -1477,12 +1479,47 @@ impl App for ViewerApp {
                     let tint = Color32::from_white_alpha(
                         (prev_alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
                     );
-                    draw_page(prev_start % total, tint);
+                    draw_static_page(prev_start % total, tint);
                 }
 
                 let cur_tint =
                     Color32::from_white_alpha((fade_cur.clamp(0.0, 1.0) * 255.0).round() as u8);
-                draw_page(self.current % total, cur_tint);
+                let start_idx = self.current % total;
+                if cur_tint.a() != 0 {
+                    for i in 0..visible_now {
+                        let idx = (start_idx + i) % total;
+                        let entry = &self.images[idx];
+                        let tex_size = entry.tex.size_vec2();
+                        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                            continue;
+                        }
+                        let fit_w = tile_width / tex_size.x;
+                        let fit_h = viewport.y / tex_size.y;
+                        let mut fit = fit_w.min(fit_h).min(1.0);
+                        if !fit.is_finite() || fit <= 0.0 {
+                            fit = 1.0;
+                        }
+                        let size = tex_size * fit * self.zoom;
+                        let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
+                        let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
+                        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                        painter.image(
+                            entry.tex.id(),
+                            rect,
+                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            cur_tint,
+                        );
+                        if resp.hovered() {
+                            set_grab(false);
+                        }
+                        if resp.dragged()
+                            && !(self.suppress_drag_once || self.suppress_drag_until_release)
+                        {
+                            self.pan += resp.drag_delta();
+                            set_grab(true);
+                        }
+                    }
+                }
 
                 if clear_transition {
                     self.transition = None;
