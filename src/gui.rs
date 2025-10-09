@@ -186,6 +186,9 @@ pub struct ViewerApp {
     // Ignore panning until all pointer buttons are released after a toggle
     suppress_drag_until_release: bool,
 
+    // Deferred reset to cover viewport changes (processed at frame start)
+    pending_reset_pan_zoom: bool,
+
     zoom: f32,
     pan: Vec2,
     last_cursor: Option<egui::Pos2>,
@@ -320,6 +323,7 @@ impl ViewerApp {
 
             suppress_drag_once: false,
             suppress_drag_until_release: false,
+            pending_reset_pan_zoom: false,
             zoom: 1.0,
             pan: Vec2::ZERO,
             last_cursor: None,
@@ -450,10 +454,34 @@ impl ViewerApp {
     }
 
     #[inline]
-    fn reset_view_like_new(&mut self) {
+    fn reset_reel_offsets(&mut self) {
+        if !self.reel_enabled {
+            return;
+        }
+        if self.images.is_empty() {
+            self.reel_target = 0.0;
+            self.reel_pos = 0.0;
+        } else {
+            let anchor = self.current.min(self.reel_max_start());
+            self.reel_target = anchor as f32;
+            self.reel_pos = self.reel_target;
+        }
+        self.reel_scroll_accum = 0.0;
+        self.reel_snap_hold = 0;
+    }
+
+    #[inline]
+    fn reset_pan_zoom(&mut self) {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.last_cursor = None;
+        self.reset_reel_offsets();
+        self.pending_reset_pan_zoom = false;
+    }
+
+    #[inline]
+    fn reset_view_like_new(&mut self) {
+        self.reset_pan_zoom();
         self.suppress_drag_once = true;
     }
 
@@ -516,6 +544,8 @@ impl ViewerApp {
             self.is_borderless_fs = false;
         }
 
+        self.reset_pan_zoom();
+        self.pending_reset_pan_zoom = true;
         ctx.request_repaint();
     }
 
@@ -536,9 +566,7 @@ impl ViewerApp {
         }
         self.transition = None;
 
-        self.zoom = 1.;
-        self.pan = Vec2::ZERO;
-        self.last_cursor = None;
+        self.reset_pan_zoom();
         self.prefetch.dirty = true;
     }
 
@@ -798,6 +826,12 @@ impl App for ViewerApp {
         use egui::{ColorImage, CursorIcon, Key, PointerButton};
 
         let input = ctx.input(|i| i.clone());
+
+        if self.pending_reset_pan_zoom {
+            self.reset_pan_zoom();
+            self.suppress_drag_once = true;
+            self.suppress_drag_until_release = true;
+        }
 
         // Ultra-fast global double-click anywhere (raw press pairing)
         {
@@ -1109,9 +1143,7 @@ impl App for ViewerApp {
                                 self.file_paths.clear();
                                 self.file_paths
                                     .extend(self.files.iter().map(|m| m.path.clone()));
-                                self.zoom = 1.0;
-                                self.pan = Vec2::ZERO;
-                                self.last_cursor = None;
+                                self.reset_pan_zoom();
                                 self.transition = None;
                                 self.qstate.enqueued.clear();
                                 if self.reel_enabled {
@@ -1185,6 +1217,8 @@ impl App for ViewerApp {
             let viewport = avail.size();
             let visible_now = self.visible_per_page().min(self.images.len()).max(1);
             let multi_page = !self.reel_enabled && visible_now > 1;
+            let pointer_down = input.pointer.any_down();
+            let suppress_drag = self.suppress_drag_once || self.suppress_drag_until_release;
 
             if let Some(p) = input.pointer.hover_pos() {
                 self.last_cursor = Some(p);
@@ -1273,6 +1307,7 @@ impl App for ViewerApp {
 
                     let mut drag_dx = 0.0f32;
                     let mut drag_dy = 0.0f32;
+                    let allow_drag = pointer_down && !suppress_drag;
 
                     for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
                         let idx_isize = base_idx as isize + k;
@@ -1314,14 +1349,14 @@ impl App for ViewerApp {
                         if resp.hovered() {
                             set_grab(false);
                         }
-                        if resp.dragged() {
+                        if resp.dragged() && allow_drag {
                             let delta = resp.drag_delta();
                             drag_dx += delta.x;
                             drag_dy += delta.y;
                         }
                     }
 
-                    if drag_dx != 0.0 || drag_dy != 0.0 {
+                    if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
                         let step_ref = if base_idx + 1 < total {
                             step_between(base_idx, base_idx + 1).max(1.0)
                         } else if base_idx > 0 {
@@ -1366,6 +1401,7 @@ impl App for ViewerApp {
                     // Dragging: horizontal drag scrolls the reel, vertical drag pans.
                     let mut drag_dx = 0.0f32;
                     let mut drag_dy = 0.0f32;
+                    let allow_drag = pointer_down && !suppress_drag;
 
                     for i in 0..tiles_to_draw {
                         let idx = start_idx + i;
@@ -1400,14 +1436,14 @@ impl App for ViewerApp {
                         if resp.hovered() {
                             set_grab(false);
                         }
-                        if resp.dragged() {
+                        if resp.dragged() && allow_drag {
                             let delta = resp.drag_delta();
                             drag_dx += delta.x;
                             drag_dy += delta.y;
                         }
                     }
 
-                    if drag_dx != 0.0 || drag_dy != 0.0 {
+                    if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
                         let step = tile_step.max(1.0);
                         self.reel_target = (self.reel_target - drag_dx / step).clamp(0.0, max_start);
                         self.pan.y += drag_dy;
