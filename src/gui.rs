@@ -25,10 +25,10 @@ const IMG_BATCH_CAPACITY: usize = UPLOADS_PER_FRAME * 4;
 const XFADE_SECS: f32 = 0.16; // set 0.0 for hard snap
 
 /* Reel tuneables (all GUI-thread driven) */
-const REEL_GAP_PX: f32 = 12.0;     // gap between tiles
-const REEL_NEIGHBORS: isize = 3;   // tiles to draw on each side
-const REEL_OMEGA: f32 = 14.0;      // responsiveness (larger = snappier)
-const REEL_SNAP_EPS: f32 = 0.15;   // when |target - pos| < eps, snap current
+const REEL_GAP_PX: f32 = 12.0; // gap between tiles
+const REEL_NEIGHBORS: isize = 3; // tiles to draw on each side
+const REEL_OMEGA: f32 = 14.0; // responsiveness (larger = snappier)
+const REEL_SNAP_EPS: f32 = 0.15; // when |target - pos| < eps, snap current
 
 /* ───────────────────────── domain types ─────────────────────────── */
 
@@ -71,7 +71,9 @@ enum Layout {
     Three,
 }
 impl Layout {
-    fn all() -> [Self; 3] { [Self::One, Self::Two, Self::Three] }
+    fn all() -> [Self; 3] {
+        [Self::One, Self::Two, Self::Three]
+    }
     fn label(self) -> &'static str {
         match self {
             Self::One => "1 image",
@@ -199,11 +201,11 @@ pub struct ViewerApp {
 
     // Reel mode (carousel)
     reel_enabled: bool,
-    reel_pos: f32,               // fractional index
-    reel_target: f32,            // desired index
-    last_anim_tick: Instant,     // frame delta clock
+    reel_pos: f32,           // fractional index
+    reel_target: f32,        // desired index
+    last_anim_tick: Instant, // frame delta clock
     last_prefetch_center: Option<usize>,
-    reel_snap_hold: u8,          // small debounce frames after keyboard jumps
+    reel_snap_hold: u8, // small debounce frames after keyboard jumps
 }
 
 impl ViewerApp {
@@ -233,14 +235,20 @@ impl ViewerApp {
                     buf.clear();
 
                     loop {
-                        if upstream_closed { break; }
+                        if upstream_closed {
+                            break;
+                        }
                         match upstream.recv_timeout(Duration::from_millis(3)) {
                             Ok(msg) => {
                                 buf.push_back(msg);
-                                if buf.len() >= IMG_BATCH_CAPACITY { break; }
+                                if buf.len() >= IMG_BATCH_CAPACITY {
+                                    break;
+                                }
                             }
                             Err(RecvTimeoutError::Timeout) => {
-                                if !buf.is_empty() { break; }
+                                if !buf.is_empty() {
+                                    break;
+                                }
                             }
                             Err(RecvTimeoutError::Disconnected) => {
                                 upstream_closed = true;
@@ -250,12 +258,18 @@ impl ViewerApp {
                     }
 
                     if buf.is_empty() {
-                        if pool_tx.send(buf).is_err() { break; }
-                        if upstream_closed { break; }
+                        if pool_tx.send(buf).is_err() {
+                            break;
+                        }
+                        if upstream_closed {
+                            break;
+                        }
                         continue;
                     }
 
-                    if batch_tx.send(buf).is_err() { break; }
+                    if batch_tx.send(buf).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -312,7 +326,7 @@ impl ViewerApp {
 
             transition: None,
 
-            reel_enabled: true,     // default ON for convenience
+            reel_enabled: true, // default ON for convenience
             reel_pos: 0.0,
             reel_target: 0.0,
             last_anim_tick: Instant::now(),
@@ -343,7 +357,9 @@ impl ViewerApp {
     }
 
     fn resort_images_preserve_current(&mut self) {
-        if !self.images_dirty { return; }
+        if !self.images_dirty {
+            return;
+        }
         if self.images.len() <= 1 {
             self.images_dirty = false;
             return;
@@ -384,7 +400,6 @@ impl ViewerApp {
 
         self.images_dirty = false;
     }
-
 
     pub fn spawn_loader(&mut self, dir: PathBuf) {
         self.reset_for_new_load();
@@ -496,10 +511,14 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    fn current_img(&self) -> Option<&ImgEntry> { self.images.get(self.current) }
+    fn current_img(&self) -> Option<&ImgEntry> {
+        self.images.get(self.current)
+    }
 
     fn delete_current(&mut self) {
-        if self.images.is_empty() { return; }
+        if self.images.is_empty() {
+            return;
+        }
         let path = self.images[self.current].path.clone();
         let _ = std::fs::remove_file(&path);
         self.images.remove(self.current);
@@ -541,7 +560,9 @@ impl ViewerApp {
     }
 
     fn next(&mut self) {
-        if self.images.len() <= 1 { return; }
+        if self.images.len() <= 1 {
+            return;
+        }
         if self.reel_enabled {
             let max_idx = (self.images.len() - 1) as f32;
             self.reel_target = (self.reel_target + 1.0).clamp(0.0, max_idx);
@@ -551,7 +572,12 @@ impl ViewerApp {
             let to = (self.current + 1) % self.images.len();
             self.current = to;
             if XFADE_SECS > 0.0 {
-                self.transition = Some(Transition { from_idx: from, to_idx: to, start: Instant::now(), dur: XFADE_SECS });
+                self.transition = Some(Transition {
+                    from_idx: from,
+                    to_idx: to,
+                    start: Instant::now(),
+                    dur: XFADE_SECS,
+                });
             } else {
                 self.transition = None;
             }
@@ -559,7 +585,9 @@ impl ViewerApp {
         self.prefetch.dirty = true;
     }
     fn prev(&mut self) {
-        if self.images.len() <= 1 { return; }
+        if self.images.len() <= 1 {
+            return;
+        }
         if self.reel_enabled {
             let max_idx = (self.images.len() - 1) as f32;
             self.reel_target = (self.reel_target - 1.0).clamp(0.0, max_idx);
@@ -569,7 +597,12 @@ impl ViewerApp {
             let to = (self.current + self.images.len() - 1) % self.images.len();
             self.current = to;
             if XFADE_SECS > 0.0 {
-                self.transition = Some(Transition { from_idx: from, to_idx: to, start: Instant::now(), dur: XFADE_SECS });
+                self.transition = Some(Transition {
+                    from_idx: from,
+                    to_idx: to,
+                    start: Instant::now(),
+                    dur: XFADE_SECS,
+                });
             } else {
                 self.transition = None;
             }
@@ -586,19 +619,27 @@ impl ViewerApp {
     }
 
     fn fit_for_idx(&self, idx: usize, viewport: Vec2) -> f32 {
-        if viewport.x <= 0.0 || viewport.y <= 0.0 || idx >= self.images.len() { return 1.0; }
+        if viewport.x <= 0.0 || viewport.y <= 0.0 || idx >= self.images.len() {
+            return 1.0;
+        }
         let tex_size = self.images[idx].tex.size_vec2();
-        if tex_size.x <= 0.0 || tex_size.y <= 0.0 { return 1.0; }
+        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+            return 1.0;
+        }
         let fit_w = viewport.x / tex_size.x;
         let fit_h = viewport.y / tex_size.y;
         fit_w.min(fit_h).min(1.0)
     }
     fn scale_target_for(&self, center: f32, viewport: Vec2) -> f32 {
-        if self.images.is_empty() { return 1.0; }
+        if self.images.is_empty() {
+            return 1.0;
+        }
         let total = self.images.len();
         let clamped_center = center.clamp(0.0, (total - 1) as f32);
         let mut base_idx = clamped_center.floor() as usize;
-        if base_idx >= total { base_idx = total - 1; }
+        if base_idx >= total {
+            base_idx = total - 1;
+        }
         let frac = (clamped_center - base_idx as f32).clamp(0.0, 1.0);
         let base_fit = self.fit_for_idx(base_idx, viewport);
         if frac > 0.0 && base_idx + 1 < total {
@@ -611,7 +652,9 @@ impl ViewerApp {
 
     #[inline]
     fn step_reel_animation(&mut self, ctx: &egui::Context, viewport: Vec2) {
-        if !self.reel_enabled || self.images.is_empty() { return; }
+        if !self.reel_enabled || self.images.is_empty() {
+            return;
+        }
 
         let max_idx = (self.images.len() - 1) as f32;
         self.reel_target = self.reel_target.clamp(0.0, max_idx);
@@ -632,10 +675,16 @@ impl ViewerApp {
             self.reel_snap_hold -= 1;
             should_snap = false;
         }
-        let candidate_idx = if should_snap { target_idx } else { self.current };
+        let candidate_idx = if should_snap {
+            target_idx
+        } else {
+            self.current
+        };
         if candidate_idx != self.current {
             self.current = candidate_idx;
-            if should_snap { self.reel_snap_hold = 0; }
+            if should_snap {
+                self.reel_snap_hold = 0;
+            }
             if self.last_prefetch_center != Some(candidate_idx) {
                 self.last_prefetch_center = Some(candidate_idx);
                 self.prefetch.dirty = true;
@@ -689,9 +738,13 @@ impl App for ViewerApp {
         self.prev_alt_down = input.modifiers.alt;
 
         /* Is reel moving or crossfade active? Throttle heavy work while in motion. */
-        let reel_active = self.reel_enabled && !self.images.is_empty()
+        let reel_active = self.reel_enabled
+            && !self.images.is_empty()
             && (self.reel_target - self.reel_pos).abs() > 0.0005;
-        let xfade_active = self.transition.as_ref().map_or(false, |t| t.progress() < 1.0);
+        let xfade_active = self
+            .transition
+            .as_ref()
+            .map_or(false, |t| t.progress() < 1.0);
         let anim_active = reel_active || xfade_active;
 
         // 1) Drain decoded images → upload textures (throttle during animation)
@@ -717,9 +770,13 @@ impl App for ViewerApp {
                 },
             };
 
-            let Some((path, w, h, rgba, bytes, created)) = next_msg else { continue };
+            let Some((path, w, h, rgba, bytes, created)) = next_msg else {
+                continue;
+            };
 
-            if self.qstate.seen.contains(&path) { continue; }
+            if self.qstate.seen.contains(&path) {
+                continue;
+            }
 
             let tex = ctx.load_texture(
                 path.file_name().unwrap().to_string_lossy(),
@@ -743,7 +800,9 @@ impl App for ViewerApp {
             uploaded += 1;
         }
         if uploaded > 0 {
-            if self.images_dirty { self.resort_images_preserve_current(); }
+            if self.images_dirty {
+                self.resort_images_preserve_current();
+            }
             ctx.request_repaint();
         }
 
@@ -771,7 +830,8 @@ impl App for ViewerApp {
             );
 
             self.file_paths.clear();
-            self.file_paths.extend(self.files.iter().map(|m| m.path.clone()));
+            self.file_paths
+                .extend(self.files.iter().map(|m| m.path.clone()));
 
             self.recenter_prefetch();
             self.pending_paths_since_sort = 0;
@@ -782,7 +842,11 @@ impl App for ViewerApp {
         // 3) Prefetch scheduling (pause during animation to reduce contention)
         {
             let gen = self.current_gen.load(Ordering::Relaxed);
-            let budget = if anim_active { 0 } else { load::PREFETCH_PER_TICK };
+            let budget = if anim_active {
+                0
+            } else {
+                load::PREFETCH_PER_TICK
+            };
             let _enq = if budget == 0 {
                 0
             } else {
@@ -795,17 +859,27 @@ impl App for ViewerApp {
                     gen,
                 )
             };
-            if _enq > 0 { ctx.request_repaint(); }
+            if _enq > 0 {
+                ctx.request_repaint();
+            }
         }
 
         // 4) Hotkeys
-        if input.key_pressed(Key::ArrowRight) { self.next(); }
-        if input.key_pressed(Key::ArrowLeft) { self.prev(); }
-        if input.key_pressed(Key::F11) { self.toggle_borderless_fullscreen(ctx); }
+        if input.key_pressed(Key::ArrowRight) {
+            self.next();
+        }
+        if input.key_pressed(Key::ArrowLeft) {
+            self.prev();
+        }
+        if input.key_pressed(Key::F11) {
+            self.toggle_borderless_fullscreen(ctx);
+        }
         if input.key_pressed(Key::Escape) && self.is_borderless_fs {
             self.toggle_borderless_fullscreen(ctx);
         }
-        if input.key_pressed(Key::Delete) { self.delete_current(); }
+        if input.key_pressed(Key::Delete) {
+            self.delete_current();
+        }
         match input.raw_scroll_delta.y {
             d if d > 0.0 => self.prev(),
             d if d < 0.0 => self.next(),
@@ -815,122 +889,140 @@ impl App for ViewerApp {
         /* 5) PANELS FIRST: draw top/bottom now so CentralPanel gets the remaining space */
         if self.show_top_bar {
             egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Open file…").clicked() {
-                        if let Some(f) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "tiff", "webp"])
-                            .pick_file()
-                        {
-                            self.spawn_loader_file(f);
-                        }
-                    }
-                    if ui.button("Add folder…").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                            self.add_folder(d);
-                        }
-                    }
-                    ui.separator();
+                ui.with_layer_id(
+                    egui::LayerId::new(egui::Order::Foreground, egui::Id::new("menu_widgets")),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Open file…").clicked() {
+                                if let Some(f) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Images",
+                                        &["png", "jpg", "jpeg", "bmp", "gif", "tiff", "webp"],
+                                    )
+                                    .pick_file()
+                                {
+                                    self.spawn_loader_file(f);
+                                }
+                            }
+                            if ui.button("Add folder…").clicked() {
+                                if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                    self.add_folder(d);
+                                }
+                            }
+                            ui.separator();
 
-                    // View/sort controls
-                    let prev = (self.layout, self.sort_key, self.ascending);
-                    ui.label("View:");
-                    egui::ComboBox::from_id_source("layout")
-                        .selected_text(self.layout.label())
-                        .show_ui(ui, |ui| {
-                            for lay in Layout::all() {
-                                ui.selectable_value(&mut self.layout, lay, lay.label());
+                            // View/sort controls
+                            let prev = (self.layout, self.sort_key, self.ascending);
+                            ui.label("View:");
+                            egui::ComboBox::from_id_source("layout")
+                                .selected_text(self.layout.label())
+                                .show_ui(ui, |ui| {
+                                    for lay in Layout::all() {
+                                        ui.selectable_value(&mut self.layout, lay, lay.label());
+                                    }
+                                });
+                            ui.separator();
+                            ui.label("Sort by:");
+                            egui::ComboBox::from_id_source("sort_key")
+                                .selected_text(self.sort_key.label())
+                                .show_ui(ui, |ui| {
+                                    for k in SortKey::all() {
+                                        ui.selectable_value(&mut self.sort_key, k, k.label());
+                                    }
+                                });
+                            ui.label("Order:");
+                            egui::ComboBox::from_id_source("sort_ord")
+                                .selected_text(if self.ascending { "Asc" } else { "Desc" })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.ascending, true, "Asc");
+                                    ui.selectable_value(&mut self.ascending, false, "Desc");
+                                });
+
+                            // Reel toggle
+                            ui.separator();
+                            let reel_toggle = ui.checkbox(&mut self.reel_enabled, "Reel");
+                            if reel_toggle.changed() && self.reel_enabled {
+                                // entering reel: sync state
+                                self.reel_pos = self.current as f32;
+                                self.reel_target = self.reel_pos;
+                                self.transition = None;
+                            }
+
+                            if prev != (self.layout, self.sort_key, self.ascending) {
+                                sort::sort_images(&mut self.images, self.sort_key, self.ascending);
+                                sort::sort_files_lightweight(
+                                    &mut self.files,
+                                    self.sort_key,
+                                    self.ascending,
+                                    &mut self.index_of,
+                                );
+                                self.file_paths.clear();
+                                self.file_paths
+                                    .extend(self.files.iter().map(|m| m.path.clone()));
+                                self.zoom = 1.0;
+                                self.pan = Vec2::ZERO;
+                                self.last_cursor = None;
+                                self.transition = None;
+                                self.qstate.enqueued.clear();
+                                self.recenter_prefetch();
+                                self.prefetch.dirty = true;
+                            }
+
+                            ui.separator();
+                            if ui
+                                .add_enabled(!self.images.is_empty(), egui::Button::new("< Prev"))
+                                .clicked()
+                            {
+                                self.prev();
+                            }
+                            if ui
+                                .add_enabled(!self.images.is_empty(), egui::Button::new("Next >"))
+                                .clicked()
+                            {
+                                self.next();
                             }
                         });
-                    ui.separator();
-                    ui.label("Sort by:");
-                    egui::ComboBox::from_id_source("sort_key")
-                        .selected_text(self.sort_key.label())
-                        .show_ui(ui, |ui| {
-                            for k in SortKey::all() {
-                                ui.selectable_value(&mut self.sort_key, k, k.label());
-                            }
-                        });
-                    ui.label("Order:");
-                    egui::ComboBox::from_id_source("sort_ord")
-                        .selected_text(if self.ascending { "Asc" } else { "Desc" })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.ascending, true, "Asc");
-                            ui.selectable_value(&mut self.ascending, false, "Desc");
-                        });
-
-                    // Reel toggle
-                    ui.separator();
-                    let reel_toggle = ui.checkbox(&mut self.reel_enabled, "Reel");
-                    if reel_toggle.changed() && self.reel_enabled {
-                        // entering reel: sync state
-                        self.reel_pos = self.current as f32;
-                        self.reel_target = self.reel_pos;
-                        self.transition = None;
-                    }
-
-                    if prev != (self.layout, self.sort_key, self.ascending) {
-                        sort::sort_images(&mut self.images, self.sort_key, self.ascending);
-                        sort::sort_files_lightweight(
-                            &mut self.files,
-                            self.sort_key,
-                            self.ascending,
-                            &mut self.index_of,
-                        );
-                        self.file_paths.clear();
-                        self.file_paths.extend(self.files.iter().map(|m| m.path.clone()));
-                        self.zoom = 1.0;
-                        self.pan = Vec2::ZERO;
-                        self.last_cursor = None;
-                        self.transition = None;
-                        self.qstate.enqueued.clear();
-                        self.recenter_prefetch();
-                        self.prefetch.dirty = true;
-                    }
-
-                    ui.separator();
-                    if ui
-                        .add_enabled(!self.images.is_empty(), egui::Button::new("< Prev"))
-                        .clicked()
-                    {
-                        self.prev();
-                    }
-                    if ui
-                        .add_enabled(!self.images.is_empty(), egui::Button::new("Next >"))
-                        .clicked()
-                    {
-                        self.next();
-                    }
-                });
+                    },
+                );
             });
 
             egui::TopBottomPanel::bottom("stats").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(dir) = &self.current_dir {
-                        ui.label(format!("Last folder: {}", dir.display()));
-                        ui.separator();
-                    }
-                    if let Some(img) = self.current_img() {
-                        ui.label(&img.name);
-                        ui.separator();
-                        ui.label(format!("{} / {}", self.current + 1, self.images.len()));
-                        ui.separator();
-                        ui.label(format!("{}×{}", img.w, img.h));
-                        ui.separator();
-                        ui.label(human_bytes(img.bytes));
-                    }
-                });
+                ui.with_layer_id(
+                    egui::LayerId::new(egui::Order::Foreground, egui::Id::new("stats_widgets")),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(dir) = &self.current_dir {
+                                ui.label(format!("Last folder: {}", dir.display()));
+                                ui.separator();
+                            }
+                            if let Some(img) = self.current_img() {
+                                ui.label(&img.name);
+                                ui.separator();
+                                ui.label(format!("{} / {}", self.current + 1, self.images.len()));
+                                ui.separator();
+                                ui.label(format!("{}×{}", img.w, img.h));
+                                ui.separator();
+                                ui.label(human_bytes(img.bytes));
+                            }
+                        });
+                    },
+                );
             });
         }
 
         // 6) Central panel — reel (carousel) or single-image with crossfade
         egui::CentralPanel::default().show(ctx, |ui| {
             use egui::{Color32, Pos2, Rect, Sense};
-            if self.images.is_empty() { return; }
+            if self.images.is_empty() {
+                return;
+            }
 
             let avail = ui.available_rect_before_wrap();
             let viewport = avail.size();
 
-            if let Some(p) = input.pointer.hover_pos() { self.last_cursor = Some(p); }
+            if let Some(p) = input.pointer.hover_pos() {
+                self.last_cursor = Some(p);
+            }
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
             // Mouse-side-button zoom
@@ -947,9 +1039,17 @@ impl App for ViewerApp {
 
             let set_grab = |grabbing: bool| {
                 ctx.output_mut(|o| {
-                    o.cursor_icon = if grabbing { CursorIcon::Grabbing } else { CursorIcon::Grab };
+                    o.cursor_icon = if grabbing {
+                        CursorIcon::Grabbing
+                    } else {
+                        CursorIcon::Grab
+                    };
                 });
             };
+
+            ui.set_clip_rect(avail);
+
+            let painter = ui.painter().with_clip_rect(avail);
 
             if self.layout == Layout::One && self.reel_enabled {
                 // ── REEL MODE ────────────────────────────────────────────────
@@ -979,7 +1079,10 @@ impl App for ViewerApp {
                     let fit = (viewport.x / entry.tex.size_vec2().x)
                         .min(viewport.y / entry.tex.size_vec2().y)
                         .min(1.0);
-                    tile_cache.insert(*idx, (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id()));
+                    tile_cache.insert(
+                        *idx,
+                        (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id()),
+                    );
                 }
 
                 // function to measure spacing between two neighbors
@@ -1002,7 +1105,9 @@ impl App for ViewerApp {
                 // draw from back to front so center image sits on top visually
                 for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
                     let idx_isize = base_idx + k;
-                    if !(0..(total as isize)).contains(&idx_isize) { continue; }
+                    if !(0..(total as isize)).contains(&idx_isize) {
+                        continue;
+                    }
                     let idx = idx_isize as usize;
 
                     let &(size, tex_id) = match tile_cache.get(&idx) {
@@ -1029,14 +1134,16 @@ impl App for ViewerApp {
                     let rect = Rect::from_center_size(Pos2::new(cx, cy), size);
 
                     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-                    ui.painter().image(
+                    painter.image(
                         tex_id,
                         rect,
                         egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
 
-                    if resp.hovered() { set_grab(false); }
+                    if resp.hovered() {
+                        set_grab(false);
+                    }
                     if resp.dragged() {
                         let d = resp.drag_delta();
                         drag_dx += d.x;
@@ -1054,7 +1161,8 @@ impl App for ViewerApp {
                     } else {
                         256.0 // arbitrary fallback
                     };
-                    self.reel_target = (self.reel_target - drag_dx / step_ref).clamp(0.0, (total - 1) as f32);
+                    self.reel_target =
+                        (self.reel_target - drag_dx / step_ref).clamp(0.0, (total - 1) as f32);
                     self.pan.y += drag_dy; // keep vertical panning functional
                     set_grab(true);
                 }
@@ -1083,9 +1191,10 @@ impl App for ViewerApp {
                             .min(avail.height() / prev.tex.size_vec2().y)
                             .min(1.0);
                         let prev_size = prev.tex.size_vec2() * prev_fit * self.zoom;
-                        let prev_rect = Rect::from_center_size(avail.center() + self.pan, prev_size);
+                        let prev_rect =
+                            Rect::from_center_size(avail.center() + self.pan, prev_size);
 
-                        ui.painter().image(
+                        painter.image(
                             prev.tex.id(),
                             prev_rect,
                             egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
@@ -1093,14 +1202,18 @@ impl App for ViewerApp {
                         );
                         drew_prev = true;
 
-                        if p >= 1.0 { self.transition = None; } else { ctx.request_repaint(); }
+                        if p >= 1.0 {
+                            self.transition = None;
+                        } else {
+                            ctx.request_repaint();
+                        }
                     } else {
                         self.transition = None;
                     }
                 }
 
                 // Draw current
-                ui.painter().image(
+                painter.image(
                     cur_img.tex.id(),
                     cur_rect,
                     egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
@@ -1118,7 +1231,9 @@ impl App for ViewerApp {
                 );
 
                 // Panning
-                if resp.hovered() { set_grab(false); }
+                if resp.hovered() {
+                    set_grab(false);
+                }
                 if resp.dragged() {
                     if !(self.suppress_drag_once || self.suppress_drag_until_release) {
                         self.pan += resp.drag_delta();
@@ -1128,7 +1243,9 @@ impl App for ViewerApp {
             }
         });
 
-        if self.suppress_drag_once { self.suppress_drag_once = false; }
+        if self.suppress_drag_once {
+            self.suppress_drag_once = false;
+        }
         if self.suppress_drag_until_release && !input.pointer.any_down() {
             self.suppress_drag_until_release = false;
         }
