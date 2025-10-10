@@ -216,6 +216,7 @@ pub struct ViewerApp {
     reel_scroll_accum: f32, // accumulated scroll fractions
     reel_auto_speed: f32,   // images-per-second auto scroll rate
     reel_auto_phase: f32,   // running phase for auto scroll wrapping
+    reel_looping: bool,
 }
 
 impl ViewerApp {
@@ -348,6 +349,7 @@ impl ViewerApp {
             reel_scroll_accum: 0.0,
             reel_auto_speed: 0.0,
             reel_auto_phase: 0.0,
+            reel_looping: false,
         }
     }
 
@@ -612,9 +614,14 @@ impl ViewerApp {
             }
             let max_start = self.reel_max_start() as f32;
             let step = visible as f32;
-            self.reel_target = (self.reel_target + step).clamp(0.0, max_start);
+            if self.reel_looping {
+                self.reel_target += step;
+            } else {
+                self.reel_target = (self.reel_target + step).clamp(0.0, max_start);
+            }
             self.reel_snap_hold = 2;
             self.reel_scroll_accum = 0.0;
+            self.reel_auto_phase = self.reel_target;
         } else {
             let visible = self.visible_per_page().min(self.images.len()).max(1);
             let from = self.current;
@@ -669,9 +676,14 @@ impl ViewerApp {
             }
             let max_start = self.reel_max_start() as f32;
             let step = visible as f32;
-            self.reel_target = (self.reel_target - step).clamp(0.0, max_start);
+            if self.reel_looping {
+                self.reel_target -= step;
+            } else {
+                self.reel_target = (self.reel_target - step).clamp(0.0, max_start);
+            }
             self.reel_snap_hold = 2;
             self.reel_scroll_accum = 0.0;
+            self.reel_auto_phase = self.reel_target;
         } else {
             let visible = self.visible_per_page().min(self.images.len()).max(1);
             let from = self.current;
@@ -771,6 +783,7 @@ impl ViewerApp {
         self.last_prefetch_center = None;
         self.reel_snap_hold = 0;
         self.reel_scroll_accum = 0.0;
+        self.reel_auto_phase = self.reel_target;
     }
 
     #[inline]
@@ -782,7 +795,6 @@ impl ViewerApp {
         let total = self.images.len();
         let visible = self.visible_per_page().min(total).max(1);
         let max_start = self.reel_max_start() as f32;
-        let span = (max_start + 1.0).max(1.0);
 
         let now = Instant::now();
         let dt = (now - self.last_anim_tick).as_secs_f32().min(0.25);
@@ -794,38 +806,47 @@ impl ViewerApp {
             0.0
         };
 
-        let auto_active = max_start > 0.0 && auto_speed > 0.0001;
+        let auto_enabled = auto_speed > 0.0001;
+        let loop_mode = self.reel_looping && auto_enabled && total > 0;
 
-        if auto_active {
-            // Keep phase in sync with any manual adjustments before we drift.
-            if !self.reel_auto_phase.is_finite() {
-                self.reel_auto_phase = 0.0;
-            }
-            self.reel_auto_phase = self.reel_target.clamp(0.0, max_start);
+        if loop_mode {
+            self.reel_target += auto_speed * dt;
+        } else if auto_enabled && max_start > 0.0 {
+            self.reel_target = (self.reel_target + auto_speed * dt).min(max_start);
+        }
 
-            self.reel_auto_phase = (self.reel_auto_phase + auto_speed * dt).rem_euclid(span);
-
-            let frame_target = if self.reel_auto_phase > max_start {
-                self.reel_auto_phase - max_start
-            } else {
-                self.reel_auto_phase
-            };
-
-            self.reel_target = frame_target;
-            self.reel_pos = frame_target;
-        } else {
+        if !loop_mode {
             self.reel_target = self.reel_target.clamp(0.0, max_start);
+        }
 
-            let alpha = 1.0 - (-REEL_OMEGA * dt).exp();
-            self.reel_pos += (self.reel_target - self.reel_pos) * alpha;
+        let alpha = 1.0 - (-REEL_OMEGA * dt).exp();
+        self.reel_pos += (self.reel_target - self.reel_pos) * alpha;
+
+        if !loop_mode {
             self.reel_pos = self.reel_pos.clamp(0.0, max_start);
+        }
 
-            // Keep phase aligned for the next time auto-scroll is enabled.
+        if loop_mode {
+            self.reel_auto_phase = self.reel_target;
+            let stride = total.max(1) as f32;
+            if self.reel_target.abs() > stride * 1000.0 {
+                let shift = (self.reel_target / stride).trunc() * stride;
+                if shift != 0.0 {
+                    self.reel_target -= shift;
+                    self.reel_pos -= shift;
+                    self.reel_auto_phase -= shift;
+                }
+            }
+        } else {
             self.reel_auto_phase = self.reel_target;
         }
 
         // snap + current index + prefetch
-        let target_idx = self.reel_target.round().clamp(0.0, max_start) as usize;
+        let target_idx = if loop_mode {
+            wrap_index(self.reel_target.round() as i64, total)
+        } else {
+            self.reel_target.round().clamp(0.0, max_start) as usize
+        };
         let mut should_snap = (self.reel_target - self.reel_pos).abs() < REEL_SNAP_EPS;
         if should_snap && self.reel_snap_hold > 0 {
             self.reel_snap_hold -= 1;
@@ -833,6 +854,8 @@ impl ViewerApp {
         }
         let candidate_idx = if should_snap {
             target_idx
+        } else if loop_mode {
+            wrap_index(self.reel_pos.round() as i64, total)
         } else {
             self.current.min(self.reel_max_start())
         };
@@ -841,16 +864,18 @@ impl ViewerApp {
             if should_snap {
                 self.reel_snap_hold = 0;
             }
-            let prefetch_center = (candidate_idx + visible / 2).min(total - 1);
+            let mut prefetch_center = candidate_idx + visible / 2;
+            if prefetch_center >= total {
+                prefetch_center %= total.max(1);
+            }
             if self.last_prefetch_center != Some(prefetch_center) {
                 self.last_prefetch_center = Some(prefetch_center);
                 self.prefetch.dirty = true;
             }
         }
 
-        // keep frames ticking exactly at vsync while moving
         const EPS: f32 = 0.0005;
-        if auto_active || (self.reel_target - self.reel_pos).abs() > EPS {
+        if loop_mode || (self.reel_target - self.reel_pos).abs() > EPS {
             ctx.request_repaint(); // vsync paced
         }
     }
@@ -909,11 +934,14 @@ impl App for ViewerApp {
         self.prev_alt_down = input.modifiers.alt;
 
         /* Is reel moving or crossfade active? Throttle heavy work while in motion. */
-        let auto_reel_active =
-            self.reel_auto_speed > 0.0001 && self.reel_max_start() > 0;
+        let auto_reel_active = self.reel_looping
+            && self.reel_enabled
+            && self.reel_auto_speed > 0.0001
+            && self.reel_max_start() > 0;
+        let reel_motion = (self.reel_target - self.reel_pos).abs() > 0.0005;
         let reel_active = self.reel_enabled
             && !self.images.is_empty()
-            && (((self.reel_target - self.reel_pos).abs() > 0.0005) || auto_reel_active);
+            && (reel_motion || auto_reel_active);
         let xfade_active = self
             .transition
             .as_ref()
@@ -1086,11 +1114,16 @@ impl App for ViewerApp {
                     self.reel_scroll_accum = self.reel_scroll_accum.clamp(-0.99_f32, 0.99_f32);
                     let max_start = self.reel_max_start() as f32;
                     let prev_target = self.reel_target;
-                    let new_target =
-                        (self.reel_target + steps as f32 * visible as f32).clamp(0.0, max_start);
+                    let delta = steps as f32 * visible as f32;
+                    let new_target = if self.reel_looping {
+                        self.reel_target + delta
+                    } else {
+                        (self.reel_target + delta).clamp(0.0, max_start)
+                    };
                     handled_scroll = true;
                     if (new_target - prev_target).abs() > f32::EPSILON {
                         self.reel_target = new_target;
+                        self.reel_auto_phase = self.reel_target;
                         ctx.request_repaint();
                     }
                 }
@@ -1166,13 +1199,25 @@ impl App for ViewerApp {
                             if reel_toggle.changed() {
                                 if self.reel_enabled {
                                     self.align_reel_to_layout();
+                                } else {
+                                    self.reel_looping = false;
                                 }
+                                self.reel_auto_phase = self.reel_target;
                                 self.transition = None;
                             }
                             ui.separator();
                             let auto_slider = egui::Slider::new(&mut self.reel_auto_speed, 0.0..=5.0)
                                 .text("Auto scroll");
                             ui.add_enabled(self.reel_enabled, auto_slider);
+                            let loop_widget = ui
+                                .add_enabled(self.reel_enabled, egui::Checkbox::new(&mut self.reel_looping, "Loop"));
+                            if loop_widget.changed() {
+                                self.reel_auto_phase = self.reel_target;
+                                self.reel_pos = self.reel_target;
+                            }
+                            if !self.reel_enabled {
+                                self.reel_looping = false;
+                            }
 
                             if prev != (self.layout, self.sort_key, self.ascending) {
                                 sort::sort_images(&mut self.images, self.sort_key, self.ascending);
@@ -1307,189 +1352,362 @@ impl App for ViewerApp {
                     return;
                 }
 
+
                 if visible_now == 1 {
-                    let max_start = self.reel_max_start() as f32;
-                    let raw_pos = self.reel_pos.clamp(0.0, max_start);
-                    let mut base_idx = raw_pos.floor() as usize;
-                    if base_idx >= total {
-                        base_idx = total - 1;
-                    }
-                    let frac = (raw_pos - base_idx as f32).clamp(0.0, 1.0);
+                    if self.reel_looping {
+                        let raw_pos = self.reel_pos;
+                        let base_floor = raw_pos.floor();
+                        let frac = raw_pos - base_floor;
+                        let base_global = base_floor as i64;
 
-                    let mut neighbor_indices = Vec::new();
-                    for k in -REEL_NEIGHBORS..=REEL_NEIGHBORS {
-                        let idx_isize = base_idx as isize + k;
-                        if (0..(total as isize)).contains(&idx_isize) {
-                            neighbor_indices.push(idx_isize as usize);
-                        }
-                    }
-
-                    let mut tile_cache: HashMap<usize, (Vec2, egui::TextureId)> = HashMap::new();
-                    for idx in &neighbor_indices {
-                        let entry = &self.images[*idx];
-                        let fit = (viewport.x / entry.tex.size_vec2().x)
-                            .min(viewport.y / entry.tex.size_vec2().y)
-                            .min(1.0);
-                        tile_cache.insert(
-                            *idx,
-                            (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id()),
-                        );
-                    }
-
-                    let step_between = |a: usize, b: usize| -> f32 {
-                        let &(size_a, _) = tile_cache.get(&a).expect("missing tile size");
-                        let &(size_b, _) = tile_cache.get(&b).expect("missing tile size");
-                        0.5 * (size_a.x + size_b.x) + REEL_GAP_PX
-                    };
-
-                    let mut base_center_x = avail.center().x + self.pan.x;
-                    if frac > 0.0 && base_idx + 1 < total {
-                        base_center_x -= frac * step_between(base_idx, base_idx + 1);
-                    }
-
-                    let mut drag_dx = 0.0f32;
-                    let mut drag_dy = 0.0f32;
-                    let allow_drag = pointer_down && !suppress_drag;
-
-                    for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
-                        let idx_isize = base_idx as isize + k;
-                        if !(0..(total as isize)).contains(&idx_isize) {
-                            continue;
-                        }
-                        let idx = idx_isize as usize;
-                        let &(size, tex_id) = match tile_cache.get(&idx) {
-                            Some(entry) => entry,
-                            None => continue,
+                        let mut tile_cache: HashMap<i64, (Vec2, egui::TextureId)> = HashMap::new();
+                        let mut tile_for = |g_idx: i64| -> (Vec2, egui::TextureId) {
+                            if let Some(val) = tile_cache.get(&g_idx) {
+                                *val
+                            } else {
+                                let idx = wrap_index(g_idx, total);
+                                let entry = &self.images[idx];
+                                let fit = (viewport.x / entry.tex.size_vec2().x)
+                                    .min(viewport.y / entry.tex.size_vec2().y)
+                                    .min(1.0);
+                                let data = (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id());
+                                tile_cache.insert(g_idx, data);
+                                data
+                            }
                         };
 
-                        let mut cx = base_center_x;
-                        if idx < base_idx {
-                            let mut j = idx;
-                            while j < base_idx {
-                                cx -= step_between(j, j + 1);
-                                j += 1;
+                        let mut base_center_x = avail.center().x + self.pan.x;
+                        if frac > 0.0 {
+                            let (size_a, _) = tile_for(base_global);
+                            let (size_b, _) = tile_for(base_global + 1);
+                            let step = 0.5 * (size_a.x + size_b.x);
+                            base_center_x -= frac * step;
+                        }
+
+                        let mut drag_dx = 0.0f32;
+                        let mut drag_dy = 0.0f32;
+                        let allow_drag = pointer_down && !suppress_drag;
+
+                        for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
+                            let global_idx = base_global + k as i64;
+                            let (size, tex_id) = tile_for(global_idx);
+
+                            let mut cx = base_center_x;
+                            if k < 0 {
+                                let mut g = base_global;
+                                while g > global_idx {
+                                    let (size_prev, _) = tile_for(g - 1);
+                                    let (size_curr, _) = tile_for(g);
+                                    cx -= 0.5 * (size_prev.x + size_curr.x);
+                                    g -= 1;
+                                }
+                            } else if k > 0 {
+                                let mut g = base_global;
+                                while g < global_idx {
+                                    let (size_a, _) = tile_for(g);
+                                    let (size_b, _) = tile_for(g + 1);
+                                    cx += 0.5 * (size_a.x + size_b.x);
+                                    g += 1;
+                                }
                             }
-                        } else if idx > base_idx {
-                            let mut j = base_idx;
-                            while j < idx {
-                                cx += step_between(j, j + 1);
-                                j += 1;
+
+                            let cy = avail.center().y + self.pan.y;
+                            let rect = Rect::from_center_size(Pos2::new(cx, cy), size);
+
+                            let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                            painter.image(
+                                tex_id,
+                                rect,
+                                egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+
+                            if resp.hovered() {
+                                set_grab(false);
+                            }
+                            if resp.dragged() && allow_drag {
+                                let delta = resp.drag_delta();
+                                drag_dx += delta.x;
+                                drag_dy += delta.y;
                             }
                         }
 
-                        let cy = avail.center().y + self.pan.y;
-                        let rect = Rect::from_center_size(Pos2::new(cx, cy), size);
-
-                        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-                        painter.image(
-                            tex_id,
-                            rect,
-                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-
-                        if resp.hovered() {
-                            set_grab(false);
+                        if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
+                            let (size_a, _) = tile_for(base_global);
+                            let (size_b, _) = tile_for(base_global + 1);
+                            let mut step_ref = 0.5 * (size_a.x + size_b.x);
+                            if !step_ref.is_finite() || step_ref <= 0.0 {
+                                step_ref = 256.0;
+                            }
+                            self.reel_target -= drag_dx / step_ref;
+                            self.reel_auto_phase = self.reel_target;
+                            self.pan.y += drag_dy;
+                            set_grab(true);
                         }
-                        if resp.dragged() && allow_drag {
-                            let delta = resp.drag_delta();
-                            drag_dx += delta.x;
-                            drag_dy += delta.y;
+                    } else {
+                        let max_start = self.reel_max_start() as f32;
+                        let raw_pos = self.reel_pos.clamp(0.0, max_start);
+                        let mut base_idx = raw_pos.floor() as usize;
+                        if base_idx >= total {
+                            base_idx = total - 1;
                         }
-                    }
+                        let frac = (raw_pos - base_idx as f32).clamp(0.0, 1.0);
 
-                    if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
-                        let step_ref = if base_idx + 1 < total {
-                            step_between(base_idx, base_idx + 1).max(1.0)
-                        } else if base_idx > 0 {
-                            step_between(base_idx - 1, base_idx).max(1.0)
-                        } else {
-                            256.0
+                        let mut neighbor_indices = Vec::new();
+                        for k in -REEL_NEIGHBORS..=REEL_NEIGHBORS {
+                            let idx_isize = base_idx as isize + k;
+                            if (0..(total as isize)).contains(&idx_isize) {
+                                neighbor_indices.push(idx_isize as usize);
+                            }
+                        }
+
+                        let mut tile_cache: HashMap<usize, (Vec2, egui::TextureId)> = HashMap::new();
+                        for idx in &neighbor_indices {
+                            let entry = &self.images[*idx];
+                            let fit = (viewport.x / entry.tex.size_vec2().x)
+                                .min(viewport.y / entry.tex.size_vec2().y)
+                                .min(1.0);
+                            tile_cache.insert(
+                                *idx,
+                                (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id()),
+                            );
+                        }
+
+                        let step_between = |a: usize, b: usize| -> f32 {
+                            let &(size_a, _) = tile_cache.get(&a).expect("missing tile size");
+                            let &(size_b, _) = tile_cache.get(&b).expect("missing tile size");
+                            0.5 * (size_a.x + size_b.x)
                         };
-                        self.reel_target =
-                            (self.reel_target - drag_dx / step_ref).clamp(0.0, max_start);
-                        self.pan.y += drag_dy;
-                        set_grab(true);
+
+                        let mut base_center_x = avail.center().x + self.pan.x;
+                        if frac > 0.0 && base_idx + 1 < total {
+                            base_center_x -= frac * step_between(base_idx, base_idx + 1);
+                        }
+
+                        let mut drag_dx = 0.0f32;
+                        let mut drag_dy = 0.0f32;
+                        let allow_drag = pointer_down && !suppress_drag;
+
+                        for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
+                            let idx_isize = base_idx as isize + k;
+                            if !(0..(total as isize)).contains(&idx_isize) {
+                                continue;
+                            }
+                            let idx = idx_isize as usize;
+                            let &(size, tex_id) = match tile_cache.get(&idx) {
+                                Some(entry) => entry,
+                                None => continue,
+                            };
+
+                            let mut cx = base_center_x;
+                            if idx < base_idx {
+                                let mut j = idx;
+                                while j < base_idx {
+                                    cx -= step_between(j, j + 1);
+                                    j += 1;
+                                }
+                            } else if idx > base_idx {
+                                let mut j = base_idx;
+                                while j < idx {
+                                    cx += step_between(j, j + 1);
+                                    j += 1;
+                                }
+                            }
+
+                            let cy = avail.center().y + self.pan.y;
+                            let rect = Rect::from_center_size(Pos2::new(cx, cy), size);
+
+                            let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                            painter.image(
+                                tex_id,
+                                rect,
+                                egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+
+                            if resp.hovered() {
+                                set_grab(false);
+                            }
+                            if resp.dragged() && allow_drag {
+                                let delta = resp.drag_delta();
+                                drag_dx += delta.x;
+                                drag_dy += delta.y;
+                            }
+                        }
+
+                        if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
+                            let step_ref = if base_idx + 1 < total {
+                                step_between(base_idx, base_idx + 1).max(1.0)
+                            } else if base_idx > 0 {
+                                step_between(base_idx - 1, base_idx).max(1.0)
+                            } else {
+                                256.0
+                            };
+                            self.reel_target =
+                                (self.reel_target - drag_dx / step_ref).clamp(0.0, max_start);
+                            self.reel_auto_phase = self.reel_target;
+                            self.pan.y += drag_dy;
+                            set_grab(true);
+                        }
                     }
                 } else {
-                    let visible = visible_now.min(total).max(1);
-                    let gap = REEL_GAP_PX;
-                    let gap_count = visible.saturating_sub(1) as f32;
-                    let mut tile_width = (viewport.x - gap * gap_count).max(1.0) / visible as f32;
-                    if !tile_width.is_finite() {
-                        tile_width = viewport.x.max(1.0) / visible as f32;
-                    }
-                    let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
-                    let total_span = tile_width * visible as f32 + gap * gap_count;
-
-                    let max_start = self.reel_max_start() as f32;
-                    let raw_pos = self.reel_pos.clamp(0.0, max_start);
-                    let mut start_idx = raw_pos.floor() as usize;
-                    if start_idx + visible > total {
-                        start_idx = total.saturating_sub(visible);
-                    }
-                    let mut offset = raw_pos - start_idx as f32;
-                    if !offset.is_finite() || offset < 0.0 {
-                        offset = 0.0;
-                    }
-
-                    let extra_tile = offset > 0.0001 && start_idx + visible < total;
-                    let tiles_to_draw = visible + if extra_tile { 1 } else { 0 };
-
-                    let base_left =
-                        avail.center().x + self.pan.x - 0.5 * total_span - offset * tile_step;
-                    let center_y = avail.center().y + self.pan.y;
-
-                    // Dragging: horizontal drag scrolls the reel, vertical drag pans.
-                    let mut drag_dx = 0.0f32;
-                    let mut drag_dy = 0.0f32;
-                    let allow_drag = pointer_down && !suppress_drag;
-
-                    for i in 0..tiles_to_draw {
-                        let idx = start_idx + i;
-                        if idx >= total {
-                            break;
+                    if self.reel_looping {
+                        let visible = visible_now.min(total).max(1);
+                        let gap = 0.0;
+                        let gap_count = visible.saturating_sub(1) as f32;
+                        let mut tile_width = (viewport.x - gap * gap_count).max(1.0) / visible as f32;
+                        if !tile_width.is_finite() {
+                            tile_width = viewport.x.max(1.0) / visible as f32;
                         }
-                        let entry = &self.images[idx];
-                        let tex_size = entry.tex.size_vec2();
-                        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
-                            continue;
+                        let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
+                        let total_span = tile_width * visible as f32 + gap * gap_count;
+
+                        let raw_pos = self.reel_pos;
+                        let start_floor = raw_pos.floor();
+                        let mut offset = raw_pos - start_floor;
+                        if !offset.is_finite() {
+                            offset = 0.0;
+                        }
+                        offset = offset.fract();
+                        if offset < 0.0 {
+                            offset += 1.0;
+                        }
+                        let start_global = start_floor as i64;
+                        let tiles_to_draw = visible + if offset > 0.0001 { 1 } else { 0 };
+
+                        let base_left =
+                            avail.center().x + self.pan.x - 0.5 * total_span - offset * tile_step;
+                        let center_y = avail.center().y + self.pan.y;
+
+                        let mut drag_dx = 0.0f32;
+                        let mut drag_dy = 0.0f32;
+                        let allow_drag = pointer_down && !suppress_drag;
+
+                        for i in 0..tiles_to_draw {
+                            let global_idx = start_global + i as i64;
+                            let idx = wrap_index(global_idx, total);
+                            let entry = &self.images[idx];
+                            let tex_size = entry.tex.size_vec2();
+                            if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                                continue;
+                            }
+
+                            let fit_w = tile_width / tex_size.x;
+                            let fit_h = viewport.y / tex_size.y;
+                            let mut fit = fit_w.min(fit_h).min(1.0);
+                            if !fit.is_finite() || fit <= 0.0 {
+                                fit = 1.0;
+                            }
+                            let size = tex_size * fit * self.zoom;
+
+                            let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
+                            let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
+
+                            let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                            painter.image(
+                                entry.tex.id(),
+                                rect,
+                                egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+
+                            if resp.hovered() {
+                                set_grab(false);
+                            }
+                            if resp.dragged() && allow_drag {
+                                let delta = resp.drag_delta();
+                                drag_dx += delta.x;
+                                drag_dy += delta.y;
+                            }
                         }
 
-                        let fit_w = tile_width / tex_size.x;
-                        let fit_h = viewport.y / tex_size.y;
-                        let mut fit = fit_w.min(fit_h).min(1.0);
-                        if !fit.is_finite() || fit <= 0.0 {
-                            fit = 1.0;
+                        if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
+                            let step = tile_step.max(1.0);
+                            self.reel_target -= drag_dx / step;
+                            self.reel_auto_phase = self.reel_target;
+                            self.pan.y += drag_dy;
+                            set_grab(true);
                         }
-                        let size = tex_size * fit * self.zoom;
-
-                        let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
-                        let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
-
-                        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-                        painter.image(
-                            entry.tex.id(),
-                            rect,
-                            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                            Color32::WHITE,
-                        );
-
-                        if resp.hovered() {
-                            set_grab(false);
+                    } else {
+                        let visible = visible_now.min(total).max(1);
+                        let gap = 0.0;
+                        let gap_count = visible.saturating_sub(1) as f32;
+                        let mut tile_width = (viewport.x - gap * gap_count).max(1.0) / visible as f32;
+                        if !tile_width.is_finite() {
+                            tile_width = viewport.x.max(1.0) / visible as f32;
                         }
-                        if resp.dragged() && allow_drag {
-                            let delta = resp.drag_delta();
-                            drag_dx += delta.x;
-                            drag_dy += delta.y;
-                        }
-                    }
+                        let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
+                        let total_span = tile_width * visible as f32 + gap * gap_count;
 
-                    if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
-                        let step = tile_step.max(1.0);
-                        self.reel_target = (self.reel_target - drag_dx / step).clamp(0.0, max_start);
-                        self.pan.y += drag_dy;
-                        set_grab(true);
+                        let max_start = self.reel_max_start() as f32;
+                        let raw_pos = self.reel_pos.clamp(0.0, max_start);
+                        let mut start_idx = raw_pos.floor() as usize;
+                        if start_idx + visible > total {
+                            start_idx = total.saturating_sub(visible);
+                        }
+                        let mut offset = raw_pos - start_idx as f32;
+                        if !offset.is_finite() || offset < 0.0 {
+                            offset = 0.0;
+                        }
+
+                        let extra_tile = offset > 0.0001 && start_idx + visible < total;
+                        let tiles_to_draw = visible + if extra_tile { 1 } else { 0 };
+
+                        let base_left =
+                            avail.center().x + self.pan.x - 0.5 * total_span - offset * tile_step;
+                        let center_y = avail.center().y + self.pan.y;
+
+                        let mut drag_dx = 0.0f32;
+                        let mut drag_dy = 0.0f32;
+                        let allow_drag = pointer_down && !suppress_drag;
+
+                        for i in 0..tiles_to_draw {
+                            let idx = start_idx + i;
+                            if idx >= total {
+                                break;
+                            }
+                            let entry = &self.images[idx];
+                            let tex_size = entry.tex.size_vec2();
+                            if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                                continue;
+                            }
+
+                            let fit_w = tile_width / tex_size.x;
+                            let fit_h = viewport.y / tex_size.y;
+                            let mut fit = fit_w.min(fit_h).min(1.0);
+                            if !fit.is_finite() || fit <= 0.0 {
+                                fit = 1.0;
+                            }
+                            let size = tex_size * fit * self.zoom;
+
+                            let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
+                            let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
+
+                            let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+                            painter.image(
+                                entry.tex.id(),
+                                rect,
+                                egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+
+                            if resp.hovered() {
+                                set_grab(false);
+                            }
+                            if resp.dragged() && allow_drag {
+                                let delta = resp.drag_delta();
+                                drag_dx += delta.x;
+                                drag_dy += delta.y;
+                            }
+                        }
+
+                        if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
+                            let step = tile_step.max(1.0);
+                            self.reel_target = (self.reel_target - drag_dx / step).clamp(0.0, max_start);
+                            self.reel_auto_phase = self.reel_target;
+                            self.pan.y += drag_dy;
+                            set_grab(true);
+                        }
                     }
                 }
             } else if multi_page {
@@ -1740,4 +1958,16 @@ fn human_bytes(b: u64) -> String {
     } else {
         format!("{b} B")
     }
+}
+
+fn wrap_index(idx: i64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len_i = len as i64;
+    let mut r = idx % len_i;
+    if r < 0 {
+        r += len_i;
+    }
+    r as usize
 }
