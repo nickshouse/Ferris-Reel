@@ -14,7 +14,7 @@ fn main() -> eframe::Result<()> {
     // GUI opts: start windowed with decorations. We manage borderless FS ourselves.
     let mut opts = NativeOptions::default();
     opts.viewport = ViewportBuilder::default()
-        .with_inner_size([960.0, 540.0])
+        .with_inner_size([1280.0, 720.0])
         .with_decorations(true);
 
     eframe::run_native(

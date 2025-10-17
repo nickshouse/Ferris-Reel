@@ -24,3 +24,6 @@ rfd               = "0.14"
 
 # Fast parallel directory walking (used by the code)
 jwalk             = "0.8.1"
+
+# Send files to the system recycle bin/trash
+trash             = "3.0"

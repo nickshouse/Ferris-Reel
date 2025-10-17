@@ -1,12 +1,16 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    io,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Instant, SystemTime},
 };
+
+#[cfg(target_os = "windows")]
+use std::process::Command;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::{egui, egui::TextureHandle, App};
@@ -124,6 +128,11 @@ impl Transition {
     fn smoothstep(p: f32) -> f32 {
         p * p * (3.0 - 2.0 * p)
     }
+}
+
+enum ImageMenuAction {
+    OpenFolder(PathBuf),
+    EditNotepad(PathBuf),
 }
 
 /* ───────────────────────── app state ─────────────────────────────── */
@@ -340,7 +349,7 @@ impl ViewerApp {
 
             transition: None,
 
-            reel_enabled: true, // default ON for convenience
+            reel_enabled: false, // default OFF so reel is opt-in
             reel_pos: 0.0,
             reel_target: 0.0,
             last_anim_tick: Instant::now(),
@@ -564,7 +573,33 @@ impl ViewerApp {
             return;
         }
         let path = self.images[self.current].path.clone();
-        let _ = std::fs::remove_file(&path);
+        let mut removed = false;
+        match trash::delete(&path) {
+            Ok(()) => {
+                removed = true;
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to move {} to recycle bin: {err}",
+                    path.display()
+                );
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        removed = true;
+                    }
+                    Err(fs_err) => {
+                        eprintln!(
+                            "Fallback remove_file failed for {}: {fs_err}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        if !removed {
+            return;
+        }
         self.images.remove(self.current);
         self.qstate.seen.remove(&path);
         if self.current >= self.images.len() && !self.images.is_empty() {
@@ -574,6 +609,81 @@ impl ViewerApp {
 
         self.reset_pan_zoom();
         self.prefetch.dirty = true;
+    }
+
+    fn image_context_menu(response: &egui::Response, path: PathBuf) -> Option<ImageMenuAction> {
+        #[derive(Clone, Copy)]
+        enum Choice {
+            OpenFolder,
+            EditNotepad,
+        }
+        let mut choice: Option<Choice> = None;
+        response.context_menu(|ui| {
+            if ui.button("Open containing folder").clicked() {
+                choice = Some(Choice::OpenFolder);
+                ui.close_menu();
+            }
+            if ui.button("Edit with Notepad").clicked() {
+                choice = Some(Choice::EditNotepad);
+                ui.close_menu();
+            }
+        });
+        choice.map(|c| match c {
+            Choice::OpenFolder => ImageMenuAction::OpenFolder(path),
+            Choice::EditNotepad => ImageMenuAction::EditNotepad(path),
+        })
+    }
+
+    fn process_image_actions(actions: Vec<ImageMenuAction>) {
+        for action in actions {
+            match action {
+                ImageMenuAction::OpenFolder(path) => {
+                    if let Err(err) = Self::open_containing_folder(&path) {
+                        eprintln!(
+                            "Failed to open containing folder for {}: {err}",
+                            path.display()
+                        );
+                    }
+                }
+                ImageMenuAction::EditNotepad(path) => {
+                    if let Err(err) = Self::edit_with_notepad(&path) {
+                        eprintln!("Failed to open Notepad for {}: {err}", path.display());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn open_containing_folder(path: &Path) -> io::Result<()> {
+        Command::new("explorer.exe")
+            .arg("/select,")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn open_containing_folder(path: &Path) -> io::Result<()> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Open containing folder is only supported on Windows",
+        ))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn edit_with_notepad(path: &Path) -> io::Result<()> {
+        Command::new("notepad.exe").arg(path).spawn().map(|_| ())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn edit_with_notepad(path: &Path) -> io::Result<()> {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Edit with Notepad is only supported on Windows",
+        ))
     }
 
     fn reset_for_new_load(&mut self) {
@@ -1300,6 +1410,8 @@ impl App for ViewerApp {
                 return;
             }
 
+            let mut context_actions: Vec<ImageMenuAction> = Vec::new();
+
             let avail = ui.available_rect_before_wrap();
             let viewport = avail.size();
             let visible_now = self.visible_per_page().min(self.images.len()).max(1);
@@ -1391,6 +1503,8 @@ impl App for ViewerApp {
                         for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
                             let global_idx = base_global + k as i64;
                             let (size, tex_id) = tile_for(global_idx);
+                            let idx_for_menu = wrap_index(global_idx, total);
+                            let menu_path = self.images[idx_for_menu].path.clone();
 
                             let mut cx = base_center_x;
                             if k < 0 {
@@ -1429,6 +1543,9 @@ impl App for ViewerApp {
                                 let delta = resp.drag_delta();
                                 drag_dx += delta.x;
                                 drag_dy += delta.y;
+                            }
+                            if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                                context_actions.push(action);
                             }
                         }
 
@@ -1494,6 +1611,7 @@ impl App for ViewerApp {
                                 continue;
                             }
                             let idx = idx_isize as usize;
+                            let menu_path = self.images[idx].path.clone();
                             let &(size, tex_id) = match tile_cache.get(&idx) {
                                 Some(entry) => entry,
                                 None => continue,
@@ -1532,6 +1650,9 @@ impl App for ViewerApp {
                                 let delta = resp.drag_delta();
                                 drag_dx += delta.x;
                                 drag_dy += delta.y;
+                            }
+                            if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                                context_actions.push(action);
                             }
                         }
 
@@ -1587,6 +1708,7 @@ impl App for ViewerApp {
                             let global_idx = start_global + i as i64;
                             let idx = wrap_index(global_idx, total);
                             let entry = &self.images[idx];
+                            let menu_path = entry.path.clone();
                             let tex_size = entry.tex.size_vec2();
                             if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
                                 continue;
@@ -1618,6 +1740,9 @@ impl App for ViewerApp {
                                 let delta = resp.drag_delta();
                                 drag_dx += delta.x;
                                 drag_dy += delta.y;
+                            }
+                            if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                                context_actions.push(action);
                             }
                         }
 
@@ -1667,6 +1792,7 @@ impl App for ViewerApp {
                                 break;
                             }
                             let entry = &self.images[idx];
+                            let menu_path = entry.path.clone();
                             let tex_size = entry.tex.size_vec2();
                             if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
                                 continue;
@@ -1699,6 +1825,9 @@ impl App for ViewerApp {
                                 drag_dx += delta.x;
                                 drag_dy += delta.y;
                             }
+                        if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                            context_actions.push(action);
+                        }
                         }
 
                         if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
@@ -1785,6 +1914,7 @@ impl App for ViewerApp {
                     for i in 0..visible_now {
                         let idx = (start_idx + i) % total;
                         let entry = &self.images[idx];
+                        let menu_path = entry.path.clone();
                         let tex_size = entry.tex.size_vec2();
                         if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
                             continue;
@@ -1814,6 +1944,9 @@ impl App for ViewerApp {
                             self.pan += resp.drag_delta();
                             set_grab(true);
                         }
+                        if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                            context_actions.push(action);
+                        }
                     }
                 }
 
@@ -1824,6 +1957,7 @@ impl App for ViewerApp {
                 // ── SINGLE IMAGE (with optional crossfade) ───────────────────
                 let cur_idx = self.current;
                 let cur_img = &self.images[cur_idx];
+                let menu_path = cur_img.path.clone();
                 let cur_fit = (avail.width() / cur_img.tex.size_vec2().x)
                     .min(avail.height() / cur_img.tex.size_vec2().y)
                     .min(1.0);
@@ -1894,7 +2028,12 @@ impl App for ViewerApp {
                         set_grab(true);
                     }
                 }
+                if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                    context_actions.push(action);
+                }
             }
+
+            ViewerApp::process_image_actions(context_actions);
         });
 
         if self.suppress_drag_once {
