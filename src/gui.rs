@@ -1439,17 +1439,15 @@ impl App for ViewerApp {
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
             // Mouse-side-button zoom
-            if !self.reel_enabled {
-                if input.pointer.button_pressed(PointerButton::Extra2) {
-                    let nz = (self.zoom * 1.1).clamp(0.1, 10.0);
-                    self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
-                    self.zoom = nz;
-                }
-                if input.pointer.button_pressed(PointerButton::Extra1) {
-                    let nz = (self.zoom / 1.1).clamp(0.1, 10.0);
-                    self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
-                    self.zoom = nz;
-                }
+            if input.pointer.button_pressed(PointerButton::Extra2) {
+                let nz = (self.zoom * 1.1).clamp(0.1, 10.0);
+                self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
+                self.zoom = nz;
+            }
+            if input.pointer.button_pressed(PointerButton::Extra1) {
+                let nz = (self.zoom / 1.1).clamp(0.1, 10.0);
+                self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
+                self.zoom = nz;
             }
 
             let set_grab = |grabbing: bool| {
@@ -1477,6 +1475,10 @@ impl App for ViewerApp {
                 if viewport.x <= 0.0 || viewport.y <= 0.0 {
                     return;
                 }
+
+                let pan_mode = (self.zoom - 1.0).abs() > 0.001
+                    || self.pan.x.abs() > 0.001
+                    || self.pan.y.abs() > 0.001;
 
 
                 if visible_now == 1 {
@@ -1564,15 +1566,19 @@ impl App for ViewerApp {
                         }
 
                         if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
-                            let (size_a, _) = tile_for(base_global);
-                            let (size_b, _) = tile_for(base_global + 1);
-                            let mut step_ref = 0.5 * (size_a.x + size_b.x);
-                            if !step_ref.is_finite() || step_ref <= 0.0 {
-                                step_ref = 256.0;
+                            if pan_mode {
+                                self.pan += Vec2::new(drag_dx, drag_dy);
+                            } else {
+                                let (size_a, _) = tile_for(base_global);
+                                let (size_b, _) = tile_for(base_global + 1);
+                                let mut step_ref = 0.5 * (size_a.x + size_b.x);
+                                if !step_ref.is_finite() || step_ref <= 0.0 {
+                                    step_ref = 256.0;
+                                }
+                                self.reel_target -= drag_dx / step_ref;
+                                self.reel_auto_phase = self.reel_target;
+                                self.pan.y += drag_dy;
                             }
-                            self.reel_target -= drag_dx / step_ref;
-                            self.reel_auto_phase = self.reel_target;
-                            self.pan.y += drag_dy;
                             set_grab(true);
                         }
                     } else {
@@ -1671,17 +1677,21 @@ impl App for ViewerApp {
                         }
 
                         if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
-                            let step_ref = if base_idx + 1 < total {
-                                step_between(base_idx, base_idx + 1).max(1.0)
-                            } else if base_idx > 0 {
-                                step_between(base_idx - 1, base_idx).max(1.0)
+                            if pan_mode {
+                                self.pan += Vec2::new(drag_dx, drag_dy);
                             } else {
-                                256.0
-                            };
-                            self.reel_target =
-                                (self.reel_target - drag_dx / step_ref).clamp(0.0, max_start);
-                            self.reel_auto_phase = self.reel_target;
-                            self.pan.y += drag_dy;
+                                let step_ref = if base_idx + 1 < total {
+                                    step_between(base_idx, base_idx + 1).max(1.0)
+                                } else if base_idx > 0 {
+                                    step_between(base_idx - 1, base_idx).max(1.0)
+                                } else {
+                                    256.0
+                                };
+                                self.reel_target =
+                                    (self.reel_target - drag_dx / step_ref).clamp(0.0, max_start);
+                                self.reel_auto_phase = self.reel_target;
+                                self.pan.y += drag_dy;
+                            }
                             set_grab(true);
                         }
                     }
@@ -1761,10 +1771,14 @@ impl App for ViewerApp {
                         }
 
                         if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
-                            let step = tile_step.max(1.0);
-                            self.reel_target -= drag_dx / step;
-                            self.reel_auto_phase = self.reel_target;
-                            self.pan.y += drag_dy;
+                            if pan_mode {
+                                self.pan += Vec2::new(drag_dx, drag_dy);
+                            } else {
+                                let step = tile_step.max(1.0);
+                                self.reel_target -= drag_dx / step;
+                                self.reel_auto_phase = self.reel_target;
+                                self.pan.y += drag_dy;
+                            }
                             set_grab(true);
                         }
                     } else {
@@ -1845,10 +1859,15 @@ impl App for ViewerApp {
                         }
 
                         if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
-                            let step = tile_step.max(1.0);
-                            self.reel_target = (self.reel_target - drag_dx / step).clamp(0.0, max_start);
-                            self.reel_auto_phase = self.reel_target;
-                            self.pan.y += drag_dy;
+                            if pan_mode {
+                                self.pan += Vec2::new(drag_dx, drag_dy);
+                            } else {
+                                let step = tile_step.max(1.0);
+                                self.reel_target =
+                                    (self.reel_target - drag_dx / step).clamp(0.0, max_start);
+                                self.reel_auto_phase = self.reel_target;
+                                self.pan.y += drag_dy;
+                            }
                             set_grab(true);
                         }
                     }
