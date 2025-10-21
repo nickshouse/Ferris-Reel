@@ -29,7 +29,6 @@ const IMG_BATCH_CAPACITY: usize = UPLOADS_PER_FRAME * 4;
 const XFADE_SECS: f32 = 0.16; // set 0.0 for hard snap
 
 /* Reel tuneables (all GUI-thread driven) */
-const REEL_GAP_PX: f32 = 12.0; // gap between tiles
 const REEL_NEIGHBORS: isize = 3; // tiles to draw on each side when showing neighbors
 const REEL_OMEGA: f32 = 14.0; // responsiveness (larger = snappier)
 const REEL_SNAP_EPS: f32 = 0.15; // when |target - pos| < eps, snap current
@@ -1383,14 +1382,29 @@ impl App for ViewerApp {
                                 ui.label(format!("Last folder: {}", dir.display()));
                                 ui.separator();
                             }
-                            if let Some(img) = self.current_img() {
-                                ui.label(&img.name);
-                                ui.separator();
-                                ui.label(format!("{} / {}", self.current + 1, self.images.len()));
-                                ui.separator();
-                                ui.label(format!("{}×{}", img.w, img.h));
-                                ui.separator();
-                                ui.label(human_bytes(img.bytes));
+                            if !self.images.is_empty() {
+                                let total = self.images.len();
+                                let visible = self.visible_per_page().min(total).max(1);
+                                let start_idx = self.current % total;
+                                let mut visible_indices: Vec<usize> = Vec::with_capacity(visible);
+                                for i in 0..visible {
+                                    visible_indices.push((start_idx + i) % total);
+                                }
+                                let names: Vec<&str> = visible_indices
+                                    .iter()
+                                    .filter_map(|&idx| self.images.get(idx).map(|entry| entry.name.as_str()))
+                                    .collect();
+                                if !names.is_empty() {
+                                    ui.label(format!("Viewing: {}", names.join(" | ")));
+                                    ui.separator();
+                                }
+                                if let Some(img) = self.current_img() {
+                                    ui.label(format!("{} / {}", self.current + 1, total));
+                                    ui.separator();
+                                    ui.label(format!("{}x{}", img.w, img.h));
+                                    ui.separator();
+                                    ui.label(human_bytes(img.bytes));
+                                }
                             }
                         });
                     },
@@ -1860,37 +1874,78 @@ impl App for ViewerApp {
                     fade_cur = a;
                 }
 
-                let gap = REEL_GAP_PX;
+                let gap = 0.0;
                 let gap_count = visible_now.saturating_sub(1) as f32;
-                let mut tile_width = (viewport.x - gap * gap_count).max(1.0) / visible_now as f32;
-                if !tile_width.is_finite() {
-                    tile_width = viewport.x.max(1.0) / visible_now as f32;
+                let mut slot_width =
+                    (viewport.x - gap * gap_count).max(1.0) / visible_now as f32;
+                if !slot_width.is_finite() {
+                    slot_width = viewport.x.max(1.0) / visible_now as f32;
                 }
-                let tile_step = tile_width + if visible_now > 1 { gap } else { 0.0 };
-                let total_span = tile_width * visible_now as f32 + gap * gap_count;
-                let base_left = avail.center().x + self.pan.x - 0.5 * total_span;
                 let center_y = avail.center().y + self.pan.y;
+
+                let layout_for = |start_idx: usize| -> Vec<(usize, Rect, bool)> {
+                    let mut widths = Vec::with_capacity(visible_now);
+                    for i in 0..visible_now {
+                        let idx = (start_idx + i) % total;
+                        let entry = &self.images[idx];
+                        let tex_size = entry.tex.size_vec2();
+                        let drawable = tex_size.x > 0.0 && tex_size.y > 0.0;
+                        let size = if drawable {
+                            let fit_w = slot_width / tex_size.x;
+                            let fit_h = viewport.y / tex_size.y;
+                            let mut fit = fit_w.min(fit_h).min(1.0);
+                            if !fit.is_finite() || fit <= 0.0 {
+                                fit = 1.0;
+                            }
+                            tex_size * fit * self.zoom
+                        } else {
+                            Vec2::ZERO
+                        };
+                        let width = if size.x.is_finite() && size.x > 0.0 {
+                            size.x
+                        } else {
+                            (slot_width * self.zoom).max(1.0)
+                        };
+                        widths.push((idx, size, width, drawable));
+                    }
+
+                    let count = widths.len();
+                    if count == 0 {
+                        return Vec::new();
+                    }
+
+                    let total_span = widths
+                        .iter()
+                        .map(|(_, _, width, _)| *width)
+                        .sum::<f32>()
+                        + gap * (count.saturating_sub(1) as f32);
+                    let base_left = avail.center().x + self.pan.x - 0.5 * total_span;
+
+                    let mut cursor = base_left;
+                    let mut slots = Vec::with_capacity(count);
+                    for (i, (idx, size, width, drawable)) in widths.into_iter().enumerate() {
+                        let center_x = cursor + width * 0.5;
+                        let rect_size = if drawable { size } else { Vec2::new(width, 0.0) };
+                        let rect =
+                            Rect::from_center_size(Pos2::new(center_x, center_y), rect_size);
+                        slots.push((idx, rect, drawable));
+                        cursor += width;
+                        if i + 1 < count {
+                            cursor += gap;
+                        }
+                    }
+                    slots
+                };
 
                 let draw_static_page = |start_idx: usize, tint: Color32| {
                     if tint.a() == 0 {
                         return;
                     }
-                    for i in 0..visible_now {
-                        let idx = (start_idx + i) % total;
-                        let entry = &self.images[idx];
-                        let tex_size = entry.tex.size_vec2();
-                        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                    for (idx, rect, drawable) in layout_for(start_idx) {
+                        if !drawable {
                             continue;
                         }
-                        let fit_w = tile_width / tex_size.x;
-                        let fit_h = viewport.y / tex_size.y;
-                        let mut fit = fit_w.min(fit_h).min(1.0);
-                        if !fit.is_finite() || fit <= 0.0 {
-                            fit = 1.0;
-                        }
-                        let size = tex_size * fit * self.zoom;
-                        let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
-                        let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
+                        let entry = &self.images[idx];
                         painter.image(
                             entry.tex.id(),
                             rect,
@@ -1911,23 +1966,12 @@ impl App for ViewerApp {
                     Color32::from_white_alpha((fade_cur.clamp(0.0, 1.0) * 255.0).round() as u8);
                 let start_idx = self.current % total;
                 if cur_tint.a() != 0 {
-                    for i in 0..visible_now {
-                        let idx = (start_idx + i) % total;
-                        let entry = &self.images[idx];
-                        let menu_path = entry.path.clone();
-                        let tex_size = entry.tex.size_vec2();
-                        if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                    for (idx, rect, drawable) in layout_for(start_idx) {
+                        if !drawable {
                             continue;
                         }
-                        let fit_w = tile_width / tex_size.x;
-                        let fit_h = viewport.y / tex_size.y;
-                        let mut fit = fit_w.min(fit_h).min(1.0);
-                        if !fit.is_finite() || fit <= 0.0 {
-                            fit = 1.0;
-                        }
-                        let size = tex_size * fit * self.zoom;
-                        let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
-                        let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
+                        let entry = &self.images[idx];
+                        let menu_path = entry.path.clone();
                         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
                         painter.image(
                             entry.tex.id(),
@@ -2110,3 +2154,4 @@ fn wrap_index(idx: i64, len: usize) -> usize {
     }
     r as usize
 }
+
