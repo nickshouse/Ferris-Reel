@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Instant, SystemTime},
 };
 
 #[cfg(target_os = "windows")]
@@ -35,7 +35,7 @@ const REEL_SNAP_EPS: f32 = 0.15; // when |target - pos| < eps, snap current
 const REEL_SCROLL_SENS: f32 = 0.01; // how many indices per scroll-point
 const REEL_SCROLL_CLAMP: f32 = 3.0; // cap per-frame scroll adjustment
 
-const ZOOM_HOLD_DELAY_MS: u64 = 200;
+const ZOOM_HOLD_DELAY_MS: u64 = 300;
 const ZOOM_REPEAT_INTERVAL_MS: u64 = 100;
 
 /* ───────────────────────── domain types ─────────────────────────── */
@@ -139,9 +139,11 @@ enum ImageMenuAction {
 
 #[derive(Default)]
 struct ZoomRepeat {
-    last_tick: Option<Instant>,
     hold_started: Option<Instant>,
     active_dir: Option<ZoomDir>,
+    last_update: Option<Instant>,
+    rate: f32,
+    pending_log: f32,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ZoomDir {
@@ -151,37 +153,63 @@ enum ZoomDir {
 
 impl ZoomRepeat {
     fn on_press(&mut self, dir: ZoomDir, now: Instant) {
+        self.pending_log += dir.step_log();
         self.active_dir = Some(dir);
         self.hold_started = Some(now);
-        self.last_tick = Some(now);
+        self.last_update = Some(now);
+        self.rate = 0.0;
     }
 
     fn on_release(&mut self, dir: ZoomDir) {
         if self.active_dir == Some(dir) {
             self.active_dir = None;
             self.hold_started = None;
-            self.last_tick = None;
         }
     }
 
-    fn poll(&mut self, pointer: &egui::PointerState, now: Instant) -> Option<ZoomDir> {
-        let dir = self.active_dir?;
-        if !pointer.button_down(dir.button()) {
-            self.on_release(dir);
-            return None;
+    fn update(&mut self, pointer: &egui::PointerState, now: Instant) -> f32 {
+        let last = self.last_update.replace(now).unwrap_or(now);
+        let dt = (now - last).as_secs_f32().clamp(0.0, 0.25);
+        if dt <= 0.0 {
+            return 0.0;
         }
-        let start = self.hold_started?;
-        if now.duration_since(start) < Duration::from_millis(ZOOM_HOLD_DELAY_MS) {
-            return None;
+
+        let mut delta = 0.0;
+
+        if self.pending_log.abs() > 1e-6 {
+            let smoothing = 1.0 - (-12.0 * dt).exp();
+            let chunk = self.pending_log * smoothing;
+            self.pending_log -= chunk;
+            delta += chunk;
         }
-        let interval = Duration::from_millis(ZOOM_REPEAT_INTERVAL_MS);
-        let mut last = self.last_tick.unwrap_or(start);
-        if now.duration_since(last) < interval {
-            return None;
+
+        if let Some(dir) = self.active_dir {
+            if !pointer.button_down(dir.button()) {
+                self.on_release(dir);
+            } else {
+                let start = self.hold_started.get_or_insert(now);
+                let elapsed = now.duration_since(*start).as_secs_f32();
+                let delay_sec = ZOOM_HOLD_DELAY_MS as f32 / 1000.0;
+                let progress = (elapsed / delay_sec).clamp(0.0, 1.0);
+                let target_rate = dir.target_rate() * progress;
+                let smoothing = 1.0 - (-8.0 * dt).exp();
+                self.rate += (target_rate - self.rate) * smoothing;
+                delta += self.rate * dt;
+                return delta;
+            }
         }
-        last += interval;
-        self.last_tick = Some(last);
-        Some(dir)
+
+        if self.rate.abs() > 1e-6 {
+            let smoothing = 1.0 - (-10.0 * dt).exp();
+            self.rate += (0.0 - self.rate) * smoothing;
+            delta += self.rate * dt;
+        }
+
+        delta
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_dir.is_some()
     }
 }
 
@@ -198,6 +226,22 @@ impl ZoomDir {
             ZoomDir::In => 1.1,
             ZoomDir::Out => 1.0 / 1.1,
         }
+    }
+
+    fn smooth_target(self) -> f32 {
+        match self {
+            ZoomDir::In => 1.1,
+            ZoomDir::Out => 1.0 / 1.1,
+        }
+    }
+
+    fn target_rate(self) -> f32 {
+        let interval = ZOOM_REPEAT_INTERVAL_MS as f32 / 1000.0;
+        (self.smooth_target()).ln() / interval.max(1e-6)
+    }
+
+    fn step_log(self) -> f32 {
+        self.factor().ln()
     }
 }
 
@@ -1518,7 +1562,8 @@ impl App for ViewerApp {
             let zoom_button_down = input
                 .pointer
                 .button_down(PointerButton::Extra1)
-                || input.pointer.button_down(PointerButton::Extra2);
+                || input.pointer.button_down(PointerButton::Extra2)
+                || self.zoom_accum.is_active();
             let suppress_drag = self.suppress_drag_once || self.suppress_drag_until_release;
 
             if let Some(p) = input.pointer.hover_pos() {
@@ -1528,30 +1573,25 @@ impl App for ViewerApp {
 
             // Mouse-side-button zoom (with hold-to-repeat)
             let now = Instant::now();
-            let mut zoom_events: Vec<ZoomDir> = Vec::new();
             if input.pointer.button_pressed(PointerButton::Extra2) {
-                zoom_events.push(ZoomDir::In);
                 self.zoom_accum.on_press(ZoomDir::In, now);
-            } else if !input.pointer.button_down(PointerButton::Extra2) {
-                self.zoom_accum.on_release(ZoomDir::In);
             }
             if input.pointer.button_pressed(PointerButton::Extra1) {
-                zoom_events.push(ZoomDir::Out);
                 self.zoom_accum.on_press(ZoomDir::Out, now);
-            } else if !input.pointer.button_down(PointerButton::Extra1) {
+            }
+            if !input.pointer.button_down(PointerButton::Extra2) {
+                self.zoom_accum.on_release(ZoomDir::In);
+            }
+            if !input.pointer.button_down(PointerButton::Extra1) {
                 self.zoom_accum.on_release(ZoomDir::Out);
             }
-            while let Some(dir) = self.zoom_accum.poll(&input.pointer, now) {
-                zoom_events.push(dir);
-            }
             let mut zoomed = false;
-            for dir in zoom_events {
-                self.apply_zoom(avail, cursor, dir.factor());
+            let smooth_delta = self.zoom_accum.update(&input.pointer, now);
+            if smooth_delta.abs() > f32::EPSILON {
+                self.apply_zoom(avail, cursor, smooth_delta.exp());
                 zoomed = true;
             }
-            if zoom_button_down {
-                ctx.request_repaint();
-            } else if zoomed {
+            if zoom_button_down || zoomed {
                 ctx.request_repaint();
             }
 
@@ -1809,6 +1849,7 @@ impl App for ViewerApp {
                         if !tile_width.is_finite() {
                             tile_width = viewport.x.max(1.0) / visible as f32;
                         }
+                        tile_width = (tile_width * self.zoom.max(0.1)).max(1.0);
                         let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
                         let total_span = tile_width * visible as f32 + gap * gap_count;
 
@@ -1894,6 +1935,7 @@ impl App for ViewerApp {
                         if !tile_width.is_finite() {
                             tile_width = viewport.x.max(1.0) / visible as f32;
                         }
+                        tile_width = (tile_width * self.zoom.max(0.1)).max(1.0);
                         let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
                         let total_span = tile_width * visible as f32 + gap * gap_count;
 
