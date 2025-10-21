@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[cfg(target_os = "windows")]
@@ -34,6 +34,9 @@ const REEL_OMEGA: f32 = 14.0; // responsiveness (larger = snappier)
 const REEL_SNAP_EPS: f32 = 0.15; // when |target - pos| < eps, snap current
 const REEL_SCROLL_SENS: f32 = 0.01; // how many indices per scroll-point
 const REEL_SCROLL_CLAMP: f32 = 3.0; // cap per-frame scroll adjustment
+
+const ZOOM_HOLD_DELAY_MS: u64 = 200;
+const ZOOM_REPEAT_INTERVAL_MS: u64 = 100;
 
 /* ───────────────────────── domain types ─────────────────────────── */
 
@@ -134,6 +137,70 @@ enum ImageMenuAction {
     EditNotepad(PathBuf),
 }
 
+#[derive(Default)]
+struct ZoomRepeat {
+    last_tick: Option<Instant>,
+    hold_started: Option<Instant>,
+    active_dir: Option<ZoomDir>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZoomDir {
+    In,
+    Out,
+}
+
+impl ZoomRepeat {
+    fn on_press(&mut self, dir: ZoomDir, now: Instant) {
+        self.active_dir = Some(dir);
+        self.hold_started = Some(now);
+        self.last_tick = Some(now);
+    }
+
+    fn on_release(&mut self, dir: ZoomDir) {
+        if self.active_dir == Some(dir) {
+            self.active_dir = None;
+            self.hold_started = None;
+            self.last_tick = None;
+        }
+    }
+
+    fn poll(&mut self, pointer: &egui::PointerState, now: Instant) -> Option<ZoomDir> {
+        let dir = self.active_dir?;
+        if !pointer.button_down(dir.button()) {
+            self.on_release(dir);
+            return None;
+        }
+        let start = self.hold_started?;
+        if now.duration_since(start) < Duration::from_millis(ZOOM_HOLD_DELAY_MS) {
+            return None;
+        }
+        let interval = Duration::from_millis(ZOOM_REPEAT_INTERVAL_MS);
+        let mut last = self.last_tick.unwrap_or(start);
+        if now.duration_since(last) < interval {
+            return None;
+        }
+        last += interval;
+        self.last_tick = Some(last);
+        Some(dir)
+    }
+}
+
+impl ZoomDir {
+    fn button(self) -> egui::PointerButton {
+        match self {
+            ZoomDir::In => egui::PointerButton::Extra2,
+            ZoomDir::Out => egui::PointerButton::Extra1,
+        }
+    }
+
+    fn factor(self) -> f32 {
+        match self {
+            ZoomDir::In => 1.1,
+            ZoomDir::Out => 1.0 / 1.1,
+        }
+    }
+}
+
 /* ───────────────────────── app state ─────────────────────────────── */
 
 pub struct ViewerApp {
@@ -206,6 +273,7 @@ pub struct ViewerApp {
 
     // For ultra-fast double-click detection
     last_primary_down: Option<Instant>,
+    zoom_accum: ZoomRepeat,
 
     // ── debounce expensive sort+recenter while many paths arrive
     last_sort_at: Instant,
@@ -342,6 +410,7 @@ impl ViewerApp {
 
             egui_ctx: egui_ctx,
             last_primary_down: None,
+            zoom_accum: ZoomRepeat::default(),
 
             last_sort_at: Instant::now(),
             pending_paths_since_sort: 0,
@@ -651,6 +720,21 @@ impl ViewerApp {
                 }
             }
         }
+    }
+
+    fn apply_zoom(&mut self, avail: egui::Rect, cursor: egui::Pos2, factor: f32) {
+        let old_zoom = self.zoom;
+        let safe_old = if old_zoom.abs() < 1e-6 { 1e-6 } else { old_zoom };
+        let new_zoom = (old_zoom * factor).clamp(0.1, 10.0);
+        if !new_zoom.is_finite() || new_zoom <= 0.0 {
+            return;
+        }
+        if (new_zoom - old_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let focus = avail.center() + self.pan;
+        self.pan += (cursor - focus) * (1.0 - new_zoom / safe_old);
+        self.zoom = new_zoom;
     }
 
     #[cfg(target_os = "windows")]
@@ -1431,6 +1515,10 @@ impl App for ViewerApp {
             let visible_now = self.visible_per_page().min(self.images.len()).max(1);
             let multi_page = !self.reel_enabled && visible_now > 1;
             let pointer_down = input.pointer.any_down();
+            let zoom_button_down = input
+                .pointer
+                .button_down(PointerButton::Extra1)
+                || input.pointer.button_down(PointerButton::Extra2);
             let suppress_drag = self.suppress_drag_once || self.suppress_drag_until_release;
 
             if let Some(p) = input.pointer.hover_pos() {
@@ -1438,16 +1526,33 @@ impl App for ViewerApp {
             }
             let cursor = self.last_cursor.unwrap_or(avail.center());
 
-            // Mouse-side-button zoom
+            // Mouse-side-button zoom (with hold-to-repeat)
+            let now = Instant::now();
+            let mut zoom_events: Vec<ZoomDir> = Vec::new();
             if input.pointer.button_pressed(PointerButton::Extra2) {
-                let nz = (self.zoom * 1.1).clamp(0.1, 10.0);
-                self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
-                self.zoom = nz;
+                zoom_events.push(ZoomDir::In);
+                self.zoom_accum.on_press(ZoomDir::In, now);
+            } else if !input.pointer.button_down(PointerButton::Extra2) {
+                self.zoom_accum.on_release(ZoomDir::In);
             }
             if input.pointer.button_pressed(PointerButton::Extra1) {
-                let nz = (self.zoom / 1.1).clamp(0.1, 10.0);
-                self.pan += (cursor - (avail.center() + self.pan)) * (1.0 - nz / self.zoom);
-                self.zoom = nz;
+                zoom_events.push(ZoomDir::Out);
+                self.zoom_accum.on_press(ZoomDir::Out, now);
+            } else if !input.pointer.button_down(PointerButton::Extra1) {
+                self.zoom_accum.on_release(ZoomDir::Out);
+            }
+            while let Some(dir) = self.zoom_accum.poll(&input.pointer, now) {
+                zoom_events.push(dir);
+            }
+            let mut zoomed = false;
+            for dir in zoom_events {
+                self.apply_zoom(avail, cursor, dir.factor());
+                zoomed = true;
+            }
+            if zoom_button_down {
+                ctx.request_repaint();
+            } else if zoomed {
+                ctx.request_repaint();
             }
 
             let set_grab = |grabbing: bool| {
@@ -1514,7 +1619,7 @@ impl App for ViewerApp {
 
                         let mut drag_dx = 0.0f32;
                         let mut drag_dy = 0.0f32;
-                        let allow_drag = pointer_down && !suppress_drag;
+                        let allow_drag = pointer_down && !suppress_drag && !zoom_button_down;
 
                         for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
                             let global_idx = base_global + k as i64;
@@ -1623,7 +1728,7 @@ impl App for ViewerApp {
 
                         let mut drag_dx = 0.0f32;
                         let mut drag_dy = 0.0f32;
-                        let allow_drag = pointer_down && !suppress_drag;
+                        let allow_drag = pointer_down && !suppress_drag && !zoom_button_down;
 
                         for k in (-REEL_NEIGHBORS..=REEL_NEIGHBORS).rev() {
                             let idx_isize = base_idx as isize + k;
@@ -1726,7 +1831,7 @@ impl App for ViewerApp {
 
                         let mut drag_dx = 0.0f32;
                         let mut drag_dy = 0.0f32;
-                        let allow_drag = pointer_down && !suppress_drag;
+                        let allow_drag = pointer_down && !suppress_drag && !zoom_button_down;
 
                         for i in 0..tiles_to_draw {
                             let global_idx = start_global + i as i64;
@@ -1812,7 +1917,7 @@ impl App for ViewerApp {
 
                         let mut drag_dx = 0.0f32;
                         let mut drag_dy = 0.0f32;
-                        let allow_drag = pointer_down && !suppress_drag;
+                        let allow_drag = pointer_down && !suppress_drag && !zoom_button_down;
 
                         for i in 0..tiles_to_draw {
                             let idx = start_idx + i;
@@ -2002,6 +2107,7 @@ impl App for ViewerApp {
                             set_grab(false);
                         }
                         if resp.dragged()
+                            && !zoom_button_down
                             && !(self.suppress_drag_once || self.suppress_drag_until_release)
                         {
                             self.pan += resp.drag_delta();
@@ -2085,7 +2191,7 @@ impl App for ViewerApp {
                 if resp.hovered() {
                     set_grab(false);
                 }
-                if resp.dragged() {
+                if resp.dragged() && !zoom_button_down {
                     if !(self.suppress_drag_once || self.suppress_drag_until_release) {
                         self.pan += resp.drag_delta();
                         set_grab(true);
