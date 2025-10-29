@@ -1045,12 +1045,14 @@ impl ViewerApp {
         };
 
         let auto_enabled = auto_speed > 0.0001;
-        let loop_mode = self.reel_looping && auto_enabled && total > 0;
+        let loop_mode = self.reel_looping && total > 0;
 
-        if loop_mode {
-            self.reel_target += auto_speed * dt;
-        } else if auto_enabled && max_start > 0.0 {
-            self.reel_target = (self.reel_target + auto_speed * dt).min(max_start);
+        if auto_enabled {
+            if loop_mode {
+                self.reel_target += auto_speed * dt;
+            } else if max_start > 0.0 {
+                self.reel_target = (self.reel_target + auto_speed * dt).min(max_start);
+            }
         }
 
         if !loop_mode {
