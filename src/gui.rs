@@ -691,10 +691,7 @@ impl ViewerApp {
                 removed = true;
             }
             Err(err) => {
-                eprintln!(
-                    "Failed to move {} to recycle bin: {err}",
-                    path.display()
-                );
+                eprintln!("Failed to move {} to recycle bin: {err}", path.display());
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         removed = true;
@@ -768,7 +765,11 @@ impl ViewerApp {
 
     fn apply_zoom(&mut self, avail: egui::Rect, cursor: egui::Pos2, factor: f32) {
         let old_zoom = self.zoom;
-        let safe_old = if old_zoom.abs() < 1e-6 { 1e-6 } else { old_zoom };
+        let safe_old = if old_zoom.abs() < 1e-6 {
+            1e-6
+        } else {
+            old_zoom
+        };
         let new_zoom = (old_zoom * factor).clamp(0.1, 10.0);
         if !new_zoom.is_finite() || new_zoom <= 0.0 {
             return;
@@ -1176,9 +1177,8 @@ impl App for ViewerApp {
             && self.reel_auto_speed > 0.0001
             && self.reel_max_start() > 0;
         let reel_motion = (self.reel_target - self.reel_pos).abs() > 0.0005;
-        let reel_active = self.reel_enabled
-            && !self.images.is_empty()
-            && (reel_motion || auto_reel_active);
+        let reel_active =
+            self.reel_enabled && !self.images.is_empty() && (reel_motion || auto_reel_active);
         let xfade_active = self
             .transition
             .as_ref()
@@ -1443,11 +1443,14 @@ impl App for ViewerApp {
                                 self.transition = None;
                             }
                             ui.separator();
-                            let auto_slider = egui::Slider::new(&mut self.reel_auto_speed, 0.0..=5.0)
-                                .text("Auto scroll");
+                            let auto_slider =
+                                egui::Slider::new(&mut self.reel_auto_speed, 0.0..=5.0)
+                                    .text("Auto scroll");
                             ui.add_enabled(self.reel_enabled, auto_slider);
-                            let loop_widget = ui
-                                .add_enabled(self.reel_enabled, egui::Checkbox::new(&mut self.reel_looping, "Loop"));
+                            let loop_widget = ui.add_enabled(
+                                self.reel_enabled,
+                                egui::Checkbox::new(&mut self.reel_looping, "Loop"),
+                            );
                             if loop_widget.changed() {
                                 self.reel_auto_phase = self.reel_target;
                                 self.reel_pos = self.reel_target;
@@ -1520,7 +1523,9 @@ impl App for ViewerApp {
                                 }
                                 let names: Vec<&str> = visible_indices
                                     .iter()
-                                    .filter_map(|&idx| self.images.get(idx).map(|entry| entry.name.as_str()))
+                                    .filter_map(|&idx| {
+                                        self.images.get(idx).map(|entry| entry.name.as_str())
+                                    })
                                     .collect();
                                 if !names.is_empty() {
                                     ui.label(format!("Viewing: {}", names.join(" | ")));
@@ -1559,9 +1564,7 @@ impl App for ViewerApp {
             let visible_now = self.visible_per_page().min(self.images.len()).max(1);
             let multi_page = !self.reel_enabled && visible_now > 1;
             let pointer_down = input.pointer.any_down();
-            let zoom_button_down = input
-                .pointer
-                .button_down(PointerButton::Extra1)
+            let zoom_button_down = input.pointer.button_down(PointerButton::Extra1)
                 || input.pointer.button_down(PointerButton::Extra2)
                 || self.zoom_accum.is_active();
             let suppress_drag = self.suppress_drag_once || self.suppress_drag_until_release;
@@ -1625,7 +1628,6 @@ impl App for ViewerApp {
                     || self.pan.x.abs() > 0.001
                     || self.pan.y.abs() > 0.001;
 
-
                 if visible_now == 1 {
                     if self.reel_looping {
                         let raw_pos = self.reel_pos;
@@ -1643,7 +1645,8 @@ impl App for ViewerApp {
                                 let fit = (viewport.x / entry.tex.size_vec2().x)
                                     .min(viewport.y / entry.tex.size_vec2().y)
                                     .min(1.0);
-                                let data = (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id());
+                                let data =
+                                    (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id());
                                 tile_cache.insert(g_idx, data);
                                 data
                             }
@@ -1743,7 +1746,8 @@ impl App for ViewerApp {
                             }
                         }
 
-                        let mut tile_cache: HashMap<usize, (Vec2, egui::TextureId)> = HashMap::new();
+                        let mut tile_cache: HashMap<usize, (Vec2, egui::TextureId)> =
+                            HashMap::new();
                         for idx in &neighbor_indices {
                             let entry = &self.images[*idx];
                             let fit = (viewport.x / entry.tex.size_vec2().x)
@@ -1845,11 +1849,13 @@ impl App for ViewerApp {
                         let visible = visible_now.min(total).max(1);
                         let gap = 0.0;
                         let gap_count = visible.saturating_sub(1) as f32;
-                        let mut tile_width = (viewport.x - gap * gap_count).max(1.0) / visible as f32;
-                        if !tile_width.is_finite() {
-                            tile_width = viewport.x.max(1.0) / visible as f32;
+                        let mut base_tile_width =
+                            (viewport.x - gap * gap_count).max(1.0) / visible as f32;
+                        if !base_tile_width.is_finite() {
+                            base_tile_width = viewport.x.max(1.0) / visible as f32;
                         }
-                        tile_width = (tile_width * self.zoom.max(0.1)).max(1.0);
+                        let zoom = self.zoom.max(0.1);
+                        let tile_width = (base_tile_width * zoom).max(1.0);
                         let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
                         let total_span = tile_width * visible as f32 + gap * gap_count;
 
@@ -1884,13 +1890,13 @@ impl App for ViewerApp {
                                 continue;
                             }
 
-                            let fit_w = tile_width / tex_size.x;
+                            let fit_w = base_tile_width / tex_size.x;
                             let fit_h = viewport.y / tex_size.y;
                             let mut fit = fit_w.min(fit_h).min(1.0);
                             if !fit.is_finite() || fit <= 0.0 {
                                 fit = 1.0;
                             }
-                            let size = tex_size * fit * self.zoom;
+                            let size = tex_size * fit * zoom;
 
                             let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
                             let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
@@ -1931,11 +1937,13 @@ impl App for ViewerApp {
                         let visible = visible_now.min(total).max(1);
                         let gap = 0.0;
                         let gap_count = visible.saturating_sub(1) as f32;
-                        let mut tile_width = (viewport.x - gap * gap_count).max(1.0) / visible as f32;
-                        if !tile_width.is_finite() {
-                            tile_width = viewport.x.max(1.0) / visible as f32;
+                        let mut base_tile_width =
+                            (viewport.x - gap * gap_count).max(1.0) / visible as f32;
+                        if !base_tile_width.is_finite() {
+                            base_tile_width = viewport.x.max(1.0) / visible as f32;
                         }
-                        tile_width = (tile_width * self.zoom.max(0.1)).max(1.0);
+                        let zoom = self.zoom.max(0.1);
+                        let tile_width = (base_tile_width * zoom).max(1.0);
                         let tile_step = tile_width + if visible > 1 { gap } else { 0.0 };
                         let total_span = tile_width * visible as f32 + gap * gap_count;
 
@@ -1973,13 +1981,13 @@ impl App for ViewerApp {
                                 continue;
                             }
 
-                            let fit_w = tile_width / tex_size.x;
+                            let fit_w = base_tile_width / tex_size.x;
                             let fit_h = viewport.y / tex_size.y;
                             let mut fit = fit_w.min(fit_h).min(1.0);
                             if !fit.is_finite() || fit <= 0.0 {
                                 fit = 1.0;
                             }
-                            let size = tex_size * fit * self.zoom;
+                            let size = tex_size * fit * zoom;
 
                             let center_x = base_left + i as f32 * tile_step + tile_width * 0.5;
                             let rect = Rect::from_center_size(Pos2::new(center_x, center_y), size);
@@ -2000,9 +2008,9 @@ impl App for ViewerApp {
                                 drag_dx += delta.x;
                                 drag_dy += delta.y;
                             }
-                        if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
-                            context_actions.push(action);
-                        }
+                            if let Some(action) = ViewerApp::image_context_menu(&resp, menu_path) {
+                                context_actions.push(action);
+                            }
                         }
 
                         if allow_drag && (drag_dx != 0.0 || drag_dy != 0.0) {
@@ -2042,8 +2050,7 @@ impl App for ViewerApp {
 
                 let gap = 0.0;
                 let gap_count = visible_now.saturating_sub(1) as f32;
-                let mut slot_width =
-                    (viewport.x - gap * gap_count).max(1.0) / visible_now as f32;
+                let mut slot_width = (viewport.x - gap * gap_count).max(1.0) / visible_now as f32;
                 if !slot_width.is_finite() {
                     slot_width = viewport.x.max(1.0) / visible_now as f32;
                 }
@@ -2080,10 +2087,7 @@ impl App for ViewerApp {
                         return Vec::new();
                     }
 
-                    let total_span = widths
-                        .iter()
-                        .map(|(_, _, width, _)| *width)
-                        .sum::<f32>()
+                    let total_span = widths.iter().map(|(_, _, width, _)| *width).sum::<f32>()
                         + gap * (count.saturating_sub(1) as f32);
                     let base_left = avail.center().x + self.pan.x - 0.5 * total_span;
 
@@ -2091,9 +2095,12 @@ impl App for ViewerApp {
                     let mut slots = Vec::with_capacity(count);
                     for (i, (idx, size, width, drawable)) in widths.into_iter().enumerate() {
                         let center_x = cursor + width * 0.5;
-                        let rect_size = if drawable { size } else { Vec2::new(width, 0.0) };
-                        let rect =
-                            Rect::from_center_size(Pos2::new(center_x, center_y), rect_size);
+                        let rect_size = if drawable {
+                            size
+                        } else {
+                            Vec2::new(width, 0.0)
+                        };
+                        let rect = Rect::from_center_size(Pos2::new(center_x, center_y), rect_size);
                         slots.push((idx, rect, drawable));
                         cursor += width;
                         if i + 1 < count {
@@ -2321,4 +2328,3 @@ fn wrap_index(idx: i64, len: usize) -> usize {
     }
     r as usize
 }
-
