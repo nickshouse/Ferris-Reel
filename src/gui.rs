@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[cfg(target_os = "windows")]
@@ -16,7 +16,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::{egui, egui::TextureHandle, App};
 use egui::Vec2;
 
-use crate::load::{self, ImgMsg, JobMsg, PathMsg};
+use crate::load::{self, ImgMsg, ImgPayload, JobMsg, PathMsg};
 use crate::sort;
 
 /* ───────────────────────── UI tuneables ─────────────────────────── */
@@ -27,6 +27,7 @@ const IMG_BATCH_CAPACITY: usize = UPLOADS_PER_FRAME * 4;
 
 /* Crossfade for single-image mode */
 const XFADE_SECS: f32 = 0.16; // set 0.0 for hard snap
+const MIN_GIF_FRAME_DELAY_SEC: f32 = 0.016;
 
 /* Reel tuneables (all GUI-thread driven) */
 const REEL_NEIGHBORS: isize = 3; // tiles to draw on each side when showing neighbors
@@ -96,11 +97,176 @@ pub(crate) struct ImgEntry {
     pub(crate) path: PathBuf,
     pub(crate) name: String,
     pub(crate) ext: String,
-    pub(crate) tex: TextureHandle,
+    content: ImgContent,
     pub(crate) w: u32,
     pub(crate) h: u32,
     pub(crate) bytes: u64,
     pub(crate) created: Option<SystemTime>,
+}
+
+enum ImgContent {
+    Static(TextureHandle),
+    Animated(AnimationState),
+}
+
+struct AnimationState {
+    frames: Vec<TextureHandle>,
+    delays: Vec<f32>,
+    loop_count: Option<u16>,
+    current: usize,
+    loops_done: u16,
+    last_switch: Instant,
+    finished: bool,
+}
+
+impl AnimationState {
+    fn new(frames: Vec<TextureHandle>, delays: Vec<f32>, loop_count: Option<u16>) -> Self {
+        let now = Instant::now();
+        Self {
+            frames,
+            delays,
+            loop_count,
+            current: 0,
+            loops_done: 0,
+            last_switch: now,
+            finished: false,
+        }
+    }
+
+    fn texture(&self) -> &TextureHandle {
+        &self.frames[self.current]
+    }
+
+    fn advance(&mut self, now: Instant) -> (bool, Option<Duration>) {
+        if self.frames.len() <= 1 || self.finished {
+            return (false, None);
+        }
+
+        let delay = self
+            .delays
+            .get(self.current)
+            .copied()
+            .unwrap_or(MIN_GIF_FRAME_DELAY_SEC);
+        let elapsed = now
+            .saturating_duration_since(self.last_switch)
+            .as_secs_f32();
+
+        if elapsed + f32::EPSILON < delay {
+            let remaining = (delay - elapsed).max(MIN_GIF_FRAME_DELAY_SEC);
+            return (
+                false,
+                Some(Duration::from_secs_f32(remaining.max(MIN_GIF_FRAME_DELAY_SEC))),
+            );
+        }
+
+        self.last_switch = now;
+        if self.current + 1 < self.frames.len() {
+            self.current += 1;
+            let next_delay = self
+                .delays
+                .get(self.current)
+                .copied()
+                .unwrap_or(MIN_GIF_FRAME_DELAY_SEC)
+                .max(MIN_GIF_FRAME_DELAY_SEC);
+            return (true, Some(Duration::from_secs_f32(next_delay)));
+        }
+
+        if let Some(limit) = self.loop_count {
+            if self.loops_done + 1 >= limit {
+                self.finished = true;
+                return (true, None);
+            }
+            self.loops_done = self.loops_done.saturating_add(1);
+        }
+
+        self.current = 0;
+        let next_delay = self
+            .delays
+            .get(self.current)
+            .copied()
+            .unwrap_or(MIN_GIF_FRAME_DELAY_SEC)
+            .max(MIN_GIF_FRAME_DELAY_SEC);
+        (true, Some(Duration::from_secs_f32(next_delay)))
+    }
+
+    fn is_running(&self) -> bool {
+        !self.finished && self.frames.len() > 1
+    }
+}
+
+impl ImgEntry {
+    fn new_static(
+        path: PathBuf,
+        name: String,
+        ext: String,
+        tex: TextureHandle,
+        width: u32,
+        height: u32,
+        bytes: u64,
+        created: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            path,
+            name,
+            ext,
+            content: ImgContent::Static(tex),
+            w: width,
+            h: height,
+            bytes,
+            created,
+        }
+    }
+
+    fn new_animated(
+        path: PathBuf,
+        name: String,
+        ext: String,
+        state: AnimationState,
+        width: u32,
+        height: u32,
+        bytes: u64,
+        created: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            path,
+            name,
+            ext,
+            content: ImgContent::Animated(state),
+            w: width,
+            h: height,
+            bytes,
+            created,
+        }
+    }
+
+    fn texture(&self) -> &TextureHandle {
+        match &self.content {
+            ImgContent::Static(tex) => tex,
+            ImgContent::Animated(state) => state.texture(),
+        }
+    }
+
+    fn texture_id(&self) -> egui::TextureId {
+        self.texture().id()
+    }
+
+    fn size_vec2(&self) -> Vec2 {
+        Vec2::new(self.w as f32, self.h as f32)
+    }
+
+    fn is_animation_running(&self) -> bool {
+        match &self.content {
+            ImgContent::Animated(state) => state.is_running(),
+            ImgContent::Static(_) => false,
+        }
+    }
+
+    fn advance_animation(&mut self, now: Instant) -> (bool, Option<Duration>) {
+        match &mut self.content {
+            ImgContent::Animated(state) => state.advance(now),
+            ImgContent::Static(_) => (false, None),
+        }
+    }
 }
 
 /* Discovered file metadata (lightweight; no decode) */
@@ -610,6 +776,38 @@ impl ViewerApp {
     fn reset_view_like_new(&mut self) {
         self.reset_pan_zoom();
         self.suppress_drag_once = true;
+    }
+
+    fn drive_animations(&mut self, ctx: &egui::Context) -> bool {
+        let now = Instant::now();
+        let mut any_running = false;
+        let mut any_advanced = false;
+        let mut next_wait: Option<Duration> = None;
+
+        for entry in &mut self.images {
+            let (advanced, wait) = entry.advance_animation(now);
+            if advanced {
+                any_advanced = true;
+            }
+            if entry.is_animation_running() {
+                any_running = true;
+            }
+            if let Some(wait) = wait {
+                next_wait = Some(match next_wait {
+                    Some(current) if current <= wait => current,
+                    _ => wait,
+                });
+            }
+        }
+
+        if any_advanced {
+            ctx.request_repaint();
+        }
+        if let Some(wait) = next_wait {
+            ctx.request_repaint_after(wait);
+        }
+
+        any_running
     }
 
     fn toggle_borderless_fullscreen(&mut self, ctx: &egui::Context) {
@@ -1173,6 +1371,8 @@ impl App for ViewerApp {
         }
         self.prev_alt_down = input.modifiers.alt;
 
+        let gif_running = self.drive_animations(ctx);
+
         /* Is reel moving or crossfade active? Throttle heavy work while in motion. */
         let auto_reel_active = self.reel_looping
             && self.reel_enabled
@@ -1185,7 +1385,7 @@ impl App for ViewerApp {
             .transition
             .as_ref()
             .map_or(false, |t| t.progress() < 1.0);
-        let anim_active = reel_active || xfade_active;
+        let anim_active = reel_active || xfade_active || gif_running;
 
         // 1) Drain decoded images → upload textures (throttle during animation)
         let uploads_cap = if anim_active { 1 } else { UPLOADS_PER_FRAME };
@@ -1210,33 +1410,93 @@ impl App for ViewerApp {
                 },
             };
 
-            let Some((path, w, h, rgba, bytes, created)) = next_msg else {
+            let Some(msg) = next_msg else {
                 continue;
             };
 
-            if self.qstate.seen.contains(&path) {
+            if self.qstate.seen.contains(&msg.path) {
                 continue;
             }
 
-            let tex = ctx.load_texture(
-                path.file_name().unwrap().to_string_lossy(),
-                ColorImage::from_rgba_unmultiplied([w, h], &rgba),
-                egui::TextureOptions::default(),
-            );
-
-            self.images.push(ImgEntry {
-                path: path.clone(),
-                name: tex.name().into(),
-                ext: tex.name().rsplit('.').next().unwrap_or("").into(),
-                tex,
-                w: w as u32,
-                h: h as u32,
+            let ImgMsg {
+                path,
+                width,
+                height,
                 bytes,
                 created,
-            });
-            self.images_dirty = true;
+                payload,
+            } = msg;
+
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let ext = path
+                .extension()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
 
             self.qstate.mark_seen(&path);
+
+            let entry = match payload {
+                ImgPayload::Static { rgba } => {
+                    let tex = ctx.load_texture(
+                        name.clone(),
+                        ColorImage::from_rgba_unmultiplied([width, height], &rgba),
+                        egui::TextureOptions::default(),
+                    );
+                    Some(ImgEntry::new_static(
+                        path,
+                        name,
+                        ext,
+                        tex,
+                        width as u32,
+                        height as u32,
+                        bytes,
+                        created,
+                    ))
+                }
+                ImgPayload::Animated { frames, loop_count } => {
+                    let mut textures = Vec::with_capacity(frames.len());
+                    let mut delays = Vec::with_capacity(frames.len());
+                    for (idx, frame) in frames.into_iter().enumerate() {
+                        let tex_name = format!("{}#{idx}", name);
+                        let tex = ctx.load_texture(
+                            tex_name,
+                            ColorImage::from_rgba_unmultiplied(
+                                [frame.width, frame.height],
+                                &frame.rgba,
+                            ),
+                            egui::TextureOptions::default(),
+                        );
+                        textures.push(tex);
+                        delays.push(frame.delay.max(MIN_GIF_FRAME_DELAY_SEC));
+                    }
+                    if textures.is_empty() {
+                        None
+                    } else {
+                        let state = AnimationState::new(textures, delays, loop_count);
+                        Some(ImgEntry::new_animated(
+                            path,
+                            name,
+                            ext,
+                            state,
+                            width as u32,
+                            height as u32,
+                            bytes,
+                            created,
+                        ))
+                    }
+                }
+            };
+
+            let Some(entry) = entry else {
+                continue;
+            };
+
+            self.images.push(entry);
+            self.images_dirty = true;
+
             uploaded += 1;
         }
         if uploaded > 0 {
@@ -1644,11 +1904,11 @@ impl App for ViewerApp {
                             } else {
                                 let idx = wrap_index(g_idx, total);
                                 let entry = &self.images[idx];
-                                let fit = (viewport.x / entry.tex.size_vec2().x)
-                                    .min(viewport.y / entry.tex.size_vec2().y)
+                                let fit = (viewport.x / entry.size_vec2().x)
+                                    .min(viewport.y / entry.size_vec2().y)
                                     .min(1.0);
                                 let data =
-                                    (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id());
+                                    (entry.size_vec2() * fit * self.zoom, entry.texture_id());
                                 tile_cache.insert(g_idx, data);
                                 data
                             }
@@ -1752,12 +2012,12 @@ impl App for ViewerApp {
                             HashMap::new();
                         for idx in &neighbor_indices {
                             let entry = &self.images[*idx];
-                            let fit = (viewport.x / entry.tex.size_vec2().x)
-                                .min(viewport.y / entry.tex.size_vec2().y)
+                            let fit = (viewport.x / entry.size_vec2().x)
+                                .min(viewport.y / entry.size_vec2().y)
                                 .min(1.0);
                             tile_cache.insert(
                                 *idx,
-                                (entry.tex.size_vec2() * fit * self.zoom, entry.tex.id()),
+                                (entry.size_vec2() * fit * self.zoom, entry.texture_id()),
                             );
                         }
 
@@ -1887,7 +2147,7 @@ impl App for ViewerApp {
                             let idx = wrap_index(global_idx, total);
                             let entry = &self.images[idx];
                             let menu_path = entry.path.clone();
-                            let tex_size = entry.tex.size_vec2();
+                            let tex_size = entry.size_vec2();
                             if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
                                 continue;
                             }
@@ -1905,7 +2165,7 @@ impl App for ViewerApp {
 
                             let resp = ui.allocate_rect(rect, Sense::click_and_drag());
                             painter.image(
-                                entry.tex.id(),
+                                entry.texture_id(),
                                 rect,
                                 egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                                 Color32::WHITE,
@@ -1978,7 +2238,7 @@ impl App for ViewerApp {
                             }
                             let entry = &self.images[idx];
                             let menu_path = entry.path.clone();
-                            let tex_size = entry.tex.size_vec2();
+                            let tex_size = entry.size_vec2();
                             if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
                                 continue;
                             }
@@ -1996,7 +2256,7 @@ impl App for ViewerApp {
 
                             let resp = ui.allocate_rect(rect, Sense::click_and_drag());
                             painter.image(
-                                entry.tex.id(),
+                                entry.texture_id(),
                                 rect,
                                 egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                                 Color32::WHITE,
@@ -2063,7 +2323,7 @@ impl App for ViewerApp {
                     for i in 0..visible_now {
                         let idx = (start_idx + i) % total;
                         let entry = &self.images[idx];
-                        let tex_size = entry.tex.size_vec2();
+                        let tex_size = entry.size_vec2();
                         let drawable = tex_size.x > 0.0 && tex_size.y > 0.0;
                         let size = if drawable {
                             let fit_w = slot_width / tex_size.x;
@@ -2122,7 +2382,7 @@ impl App for ViewerApp {
                         }
                         let entry = &self.images[idx];
                         painter.image(
-                            entry.tex.id(),
+                            entry.texture_id(),
                             rect,
                             egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             tint,
@@ -2149,7 +2409,7 @@ impl App for ViewerApp {
                         let menu_path = entry.path.clone();
                         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
                         painter.image(
-                            entry.tex.id(),
+                            entry.texture_id(),
                             rect,
                             egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             cur_tint,
@@ -2178,10 +2438,10 @@ impl App for ViewerApp {
                 let cur_idx = self.current;
                 let cur_img = &self.images[cur_idx];
                 let menu_path = cur_img.path.clone();
-                let cur_fit = (avail.width() / cur_img.tex.size_vec2().x)
-                    .min(avail.height() / cur_img.tex.size_vec2().y)
+                let cur_fit = (avail.width() / cur_img.size_vec2().x)
+                    .min(avail.height() / cur_img.size_vec2().y)
                     .min(1.0);
-                let cur_size = cur_img.tex.size_vec2() * cur_fit * self.zoom;
+                let cur_size = cur_img.size_vec2() * cur_fit * self.zoom;
                 let cur_rect = Rect::from_center_size(avail.center() + self.pan, cur_size);
 
                 // Base interaction rect
@@ -2195,15 +2455,15 @@ impl App for ViewerApp {
                         let a = Transition::smoothstep(p);
                         let prev = &self.images[t.from_idx];
 
-                        let prev_fit = (avail.width() / prev.tex.size_vec2().x)
-                            .min(avail.height() / prev.tex.size_vec2().y)
+                        let prev_fit = (avail.width() / prev.size_vec2().x)
+                            .min(avail.height() / prev.size_vec2().y)
                             .min(1.0);
-                        let prev_size = prev.tex.size_vec2() * prev_fit * self.zoom;
+                        let prev_size = prev.size_vec2() * prev_fit * self.zoom;
                         let prev_rect =
                             Rect::from_center_size(avail.center() + self.pan, prev_size);
 
                         painter.image(
-                            prev.tex.id(),
+                            prev.texture_id(),
                             prev_rect,
                             egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             Color32::from_white_alpha(((1.0 - a) * 255.0) as u8),
@@ -2222,7 +2482,7 @@ impl App for ViewerApp {
 
                 // Draw current
                 painter.image(
-                    cur_img.tex.id(),
+                    cur_img.texture_id(),
                     cur_rect,
                     egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     if drew_prev {

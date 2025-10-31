@@ -7,12 +7,37 @@ use std::{
 
 use crossbeam_channel::{select, Receiver, Sender};
 use eframe::egui;
-use image::{DynamicImage, ImageReader};
+use image::{codecs::gif::GifDecoder, AnimationDecoder, DynamicImage, ImageReader};
 
 /* ───────────────────────── channel types / caps ─────────────────── */
 
-/// (path, w, h, rgba, bytes, created)
-pub type ImgMsg = (PathBuf, usize, usize, Vec<u8>, u64, Option<SystemTime>);
+/// RGBA frame data for animated images (e.g. GIFs).
+pub struct AnimatedFrame {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+    /// Frame delay in seconds.
+    pub delay: f32,
+}
+
+/// Payload describing the decoded image data.
+pub enum ImgPayload {
+    Static { rgba: Vec<u8> },
+    Animated {
+        frames: Vec<AnimatedFrame>,
+        loop_count: Option<u16>,
+    },
+}
+
+/// Message emitted by decoder workers after loading an image.
+pub struct ImgMsg {
+    pub path: PathBuf,
+    pub width: usize,
+    pub height: usize,
+    pub bytes: u64,
+    pub created: Option<SystemTime>,
+    pub payload: ImgPayload,
+}
 /// (generation_id, path) — workers drop jobs whose gen_id != current
 pub type JobMsg = (u64, PathBuf);
 /// discovered path
@@ -24,6 +49,9 @@ pub const PATHS_CHAN_CAP: usize = 8192;
 
 // Back-pressure for decode job queue (bump to keep pipeline full with many cores)
 pub const MAX_ENQUEUED_JOBS: usize = 8192;
+
+/// Clamp for extremely short/zero GIF frame delays (roughly 60 FPS).
+const MIN_GIF_FRAME_DELAY_SEC: f32 = 0.016;
 
 /* ───────────────────────── prefetch tuneables ───────────────────── */
 
@@ -296,57 +324,133 @@ fn decode_image(path: &PathBuf) -> Result<DynamicImage, ()> {
     })
 }
 
-/// Decode at original size into RGBA
-pub fn decode_full_rgba(
-    path: &PathBuf,
-) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
-    let img = decode_image(path)?;
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-    let meta = std::fs::metadata(path).ok();
-    let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let created = meta.and_then(|m| m.created().ok());
-    Ok((w, h, rgba.into_raw(), bytes, created))
+#[inline]
+fn file_metadata(path: &PathBuf) -> (u64, Option<SystemTime>) {
+    match std::fs::metadata(path) {
+        Ok(meta) => (meta.len(), meta.created().ok()),
+        Err(_) => (0, None),
+    }
 }
 
-/// Decode and optionally downscale to fit within `max_dim`.
-pub fn decode_full_rgba_downscaled(
-    path: &PathBuf,
-    max_dim: u32,
-) -> Result<(usize, usize, Vec<u8>, u64, Option<SystemTime>), ()> {
+#[inline]
+fn scaled_dimensions(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
+    if w >= h {
+        let ratio = max_dim as f32 / w as f32;
+        let nh = ((h as f32) * ratio).round().max(1.0) as u32;
+        (max_dim, nh.max(1))
+    } else {
+        let ratio = max_dim as f32 / h as f32;
+        let nw = ((w as f32) * ratio).round().max(1.0) as u32;
+        (nw.max(1), max_dim)
+    }
+}
+
+fn decode_static_rgba(path: &PathBuf, max_dim: Option<u32>) -> Result<ImgMsg, ()> {
     use image::imageops::FilterType;
 
-    let img = decode_image(path)?;
-    let (w, h) = (img.width(), img.height());
-
-    let meta = std::fs::metadata(path).ok();
-    let bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let created = meta.and_then(|m| m.created().ok());
-
-    if w.max(h) <= max_dim {
-        let rgba = img.to_rgba8();
-        return Ok((w as usize, h as usize, rgba.into_raw(), bytes, created));
+    let mut img = decode_image(path)?;
+    if let Some(limit) = max_dim {
+        let (w, h) = (img.width(), img.height());
+        if w.max(h) > limit {
+            let (nw, nh) = scaled_dimensions(w, h, limit);
+            img = img.resize(nw, nh, FilterType::Triangle);
+        }
     }
 
-    let (nw, nh) = if w >= h {
-        let nw = max_dim;
-        let nh = ((h as f32) * (max_dim as f32 / w as f32)).round() as u32;
-        (nw, nh)
-    } else {
-        let nh = max_dim;
-        let nw = ((w as f32) * (max_dim as f32 / h as f32)).round() as u32;
-        (nw, nh)
-    };
+    let rgba = img.to_rgba8();
+    let width = rgba.width() as usize;
+    let height = rgba.height() as usize;
+    let (bytes, created) = file_metadata(path);
 
-    // Triangle is a good quality/speed tradeoff for previews.
-    let resized = img.resize(nw, nh, FilterType::Triangle).to_rgba8();
-    Ok((
-        resized.width() as usize,
-        resized.height() as usize,
-        resized.into_raw(),
+    Ok(ImgMsg {
+        path: path.clone(),
+        width,
+        height,
         bytes,
         created,
-    ))
+        payload: ImgPayload::Static { rgba: rgba.into_raw() },
+    })
+}
+
+fn decode_gif_rgba(path: &PathBuf, max_dim: Option<u32>) -> Result<ImgMsg, ()> {
+    use image::imageops::FilterType;
+    use std::io::BufReader;
+
+    #[cfg(windows)]
+    let file = open_file_sequential(path).map_err(|_| ())?;
+    #[cfg(not(windows))]
+    let file = std::fs::File::open(path).map_err(|_| ())?;
+
+    let decoder = GifDecoder::new(BufReader::new(file)).map_err(|_| ())?;
+    let mut frames_iter = decoder.into_frames();
+    let mut frames = Vec::new();
+
+    while let Some(frame_result) = frames_iter.next() {
+        let frame = frame_result.map_err(|_| ())?;
+        let delay = frame.delay();
+        let (numer, denom) = delay.numer_denom_ms();
+        let mut img = DynamicImage::ImageRgba8(frame.into_buffer());
+
+        if let Some(limit) = max_dim {
+            let (w, h) = (img.width(), img.height());
+            if w.max(h) > limit {
+                let (nw, nh) = scaled_dimensions(w, h, limit);
+                img = img.resize(nw, nh, FilterType::Triangle);
+            }
+        }
+
+        let rgba = img.to_rgba8();
+        let width = rgba.width() as usize;
+        let height = rgba.height() as usize;
+
+        let delay_ms = if denom == 0 {
+            MIN_GIF_FRAME_DELAY_SEC * 1000.0
+        } else {
+            numer as f32 / denom as f32
+        };
+        let delay_sec = (delay_ms / 1000.0).max(MIN_GIF_FRAME_DELAY_SEC);
+
+        frames.push(AnimatedFrame {
+            width,
+            height,
+            rgba: rgba.into_raw(),
+            delay: delay_sec,
+        });
+    }
+
+    if frames.is_empty() {
+        return Err(());
+    }
+
+    let (bytes, created) = file_metadata(path);
+    let width = frames[0].width;
+    let height = frames[0].height;
+
+    Ok(ImgMsg {
+        path: path.clone(),
+        width,
+        height,
+        bytes,
+        created,
+        payload: ImgPayload::Animated {
+            frames,
+            loop_count: None,
+        },
+    })
+}
+
+fn decode_path_to_msg(path: &PathBuf, max_dim: Option<u32>) -> Result<ImgMsg, ()> {
+    let is_gif = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false);
+
+    if is_gif {
+        decode_gif_rgba(path, max_dim)
+    } else {
+        decode_static_rgba(path, max_dim)
+    }
 }
 
 /* Global Rayon decoder pool (one-time init) */
@@ -436,17 +540,13 @@ pub fn start_decoder_workers_pool(
                     continue;
                 }
 
-                let decoded = if use_downscaled {
-                    decode_full_rgba_downscaled(&path, max_dim)
-                } else {
-                    decode_full_rgba(&path)
-                };
+                let decoded = decode_path_to_msg(&path, use_downscaled.then_some(max_dim));
 
-                if let Ok((w, h, rgba, bytes, created)) = decoded {
+                if let Ok(msg) = decoded {
                     if job_gen != gen.load(Ordering::Relaxed) {
                         continue;
                     }
-                    let _ = tx.send((path, w, h, rgba, bytes, created));
+                    let _ = tx.send(msg);
                     // Gentle nudge for prompt rendering without spamming
                     ctx.request_repaint_after(Duration::from_millis(8));
                 }

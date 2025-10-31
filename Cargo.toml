@@ -13,7 +13,7 @@ egui   = "0.27"
 eframe = "0.27"
 
 # Image decoding (image 0.25+ uses zune-jpeg by default; we add optional turbojpeg below)
-image             = { version = "0.25", features = ["jpeg", "png"] }
+image             = { version = "0.25", features = ["jpeg", "png", "gif"] }
 
 # Concurrency
 rayon             = "1.10"
